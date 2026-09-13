@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Wedding Album Selector</title>
+<link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+<header class="topbar">
+  <h1>Wedding Album Selector</h1>
+  <nav class="tabs">
+    <button class="tab-btn active" data-tab="setup">Setup</button>
+    <button class="tab-btn" data-tab="library">Library</button>
+    <button class="tab-btn" data-tab="editor">Editor</button>
+    <button class="tab-btn" data-tab="export">Export</button>
+  </nav>
+  <div class="save-indicator" id="saveIndicator"></div>
+</header>
+
+<main>
+
+  <!-- SETUP TAB -->
+  <section class="tab-panel active" id="tab-setup">
+    <div class="panel-card">
+      <h2>Photo Source</h2>
+      <p class="hint">Point this at the folder your OneDrive-synced wedding photos live in. Sub-folders are scanned too.</p>
+      <label>Source folder (full path)
+        <input type="text" id="sourceFolderInput" placeholder="C:\Users\you\OneDrive\Pictures\Wedding" />
+      </label>
+      <div class="btn-row">
+        <button id="scanBtn" class="primary">Scan Folder</button>
+        <button id="rescanBtn">Rescan</button>
+      </div>
+      <p id="setupStatus" class="status"></p>
+    </div>
+    <div class="panel-card">
+      <h2>Clear Library</h2>
+      <p class="hint">Forgets every photo and page this app has cataloged, so you can scan a different folder from scratch. Your real photo files are never touched by this — it only clears this app's own record in <code>data/state.json</code>.</p>
+      <button id="clearLibraryBtn" class="danger">Clear Library &amp; Start Over</button>
+      <p id="clearLibraryStatus" class="status"></p>
+    </div>
+  </section>
+
+  <!-- LIBRARY TAB -->
+  <section class="tab-panel" id="tab-library">
+    <div class="library-toolbar">
+      <input type="text" id="librarySearch" placeholder="Search by filename..." />
+      <label class="checkbox"><input type="checkbox" id="favOnlyToggle" /> Favorites only</label>
+      <span class="count-badge" id="libraryCount"></span>
+    </div>
+    <div class="photo-grid" id="libraryGrid"></div>
+  </section>
+
+  <!-- EDITOR TAB -->
+  <section class="tab-panel" id="tab-editor">
+    <div class="editor-layout">
+      <aside class="editor-library">
+        <div class="library-toolbar compact">
+          <input type="text" id="editorSearch" placeholder="Search photos..." />
+          <label class="checkbox"><input type="checkbox" id="editorFavOnly" /> Favs</label>
+          <label class="checkbox"><input type="checkbox" id="editorUnusedOnly" /> Unused</label>
+        </div>
+        <div class="photo-grid small" id="editorLibraryGrid"></div>
+      </aside>
+
+      <section class="editor-canvas">
+        <div class="editor-canvas-header">
+          <label>Total pages
+            <input type="number" id="pageCountInput" min="0" value="0" />
+          </label>
+          <div class="layout-picker" id="layoutPicker">
+            <span>Layout:</span>
+            <button data-layout="1">1</button>
+            <button data-layout="2">2</button>
+            <button data-layout="3">3</button>
+            <button data-layout="4">4</button>
+          </div>
+          <div class="page-nav-btns">
+            <button id="pageMoveUp" title="Move page earlier">&#8593;</button>
+            <button id="pageMoveDown" title="Move page later">&#8595;</button>
+          </div>
+        </div>
+        <div class="editor-canvas-header">
+          <label>Sheet size
+            <select id="pageSizePreset">
+              <option value="landscape">Landscape (11 &times; 8.5 in)</option>
+              <option value="custom">Custom size&hellip;</option>
+            </select>
+          </label>
+          <div id="pageSizeCustomInputs" class="page-size-custom" hidden>
+            <label>Width (in)
+              <input type="number" id="pageSizeWidth" min="1" step="0.1" />
+            </label>
+            <label>Height (in)
+              <input type="number" id="pageSizeHeight" min="1" step="0.1" />
+            </label>
+            <button id="pageSizeApplyBtn">Apply</button>
+          </div>
+        </div>
+        <div class="page-stage" id="pageStage">
+          <p class="empty-hint">Set a page count above to start designing your album.</p>
+        </div>
+        <input type="file" id="slotFileInput" accept="image/*" hidden />
+        <p id="slotUploadStatus" class="status"></p>
+      </section>
+    </div>
+
+    <div class="page-rail" id="pageRail"></div>
+  </section>
+
+  <!-- EXPORT TAB -->
+  <section class="tab-panel" id="tab-export">
+    <div class="panel-card">
+      <h2>Summary</h2>
+      <p id="exportSummary" class="hint"></p>
+    </div>
+    <div class="panel-card">
+      <h2>A. For the Photographer</h2>
+      <p class="hint">Copies original, full-resolution files into numbered page folders plus an index.txt. Each time you click export, a new, separately-named folder is created inside the location below — nothing from a previous export gets overwritten.</p>
+      <label>Export location (base folder)
+        <input type="text" id="destFolderInput" placeholder="C:\...\Wedding" />
+      </label>
+      <button id="exportPhotographerBtn" class="primary">Export Original Files Folder</button>
+      <p id="exportPhotographerStatus" class="status"></p>
+    </div>
+    <div class="panel-card">
+      <h2>B. For Yourself</h2>
+      <p class="hint">A single PDF preview of the album, matching your layout. Not print resolution.</p>
+      <button id="exportPdfBtn" class="primary">Generate &amp; Download PDF</button>
+      <p id="exportPdfStatus" class="status"></p>
+    </div>
+    <div class="panel-card">
+      <h2>Previous Exports</h2>
+      <p class="hint">Every "Export Original Files Folder" run you've done. Delete any you no longer need — this removes that exported copy folder from disk, not your original photos.</p>
+      <div id="exportsList"></div>
+    </div>
+  </section>
+
+</main>
+
+<!-- Photo picker modal -->
+<div class="modal-backdrop" id="pickerModal">
+  <div class="modal">
+    <div class="modal-header">
+      <h3>Choose a Photo</h3>
+      <button id="pickerClose" class="icon-btn">&times;</button>
+    </div>
+    <div class="picker-toolbar">
+      <input type="text" id="pickerSearch" placeholder="Search photos..." />
+      <button id="pickerUploadBtn">Add from my computer&hellip;</button>
+      <input type="file" id="pickerUploadInput" accept="image/*" multiple hidden />
+    </div>
+    <p id="pickerUploadStatus" class="status"></p>
+    <div class="photo-grid small" id="pickerGrid"></div>
+    <div class="modal-footer">
+      <button id="pickerRemoveBtn" class="danger">Remove Photo From Slot</button>
+    </div>
+  </div>
+</div>
+
+<!-- Crop editor -->
+<div class="modal-backdrop" id="cropModal">
+  <div class="modal crop-modal">
+    <div class="modal-header">
+      <h3>Adjust Crop</h3>
+      <button id="cropClose" class="icon-btn">&times;</button>
+    </div>
+    <div class="crop-stage-wrapper">
+      <div class="crop-stage" id="cropStage">
+        <img id="cropImage" alt="" />
+        <div class="crop-rect" id="cropRect"></div>
+      </div>
+    </div>
+    <label>Zoom
+      <input type="range" id="cropZoom" min="1" max="4" step="0.01" value="1" />
+    </label>
+    <div class="modal-footer">
+      <button id="cropCancelBtn">Cancel</button>
+      <button id="cropDoneBtn" class="primary">Done</button>
+    </div>
+  </div>
+</div>
+
+<!-- Lightbox -->
+<div class="modal-backdrop" id="lightbox">
+  <div class="lightbox-content">
+    <img id="lightboxImg" src="" alt="" />
+  </div>
+</div>
+
+<script src="js/app.js"></script>
+</body>
+</html>
