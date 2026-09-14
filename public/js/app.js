@@ -76,6 +76,7 @@
         appState = data.state;
         setStatus('#setupStatus', `Found ${data.photoCount} photos.`, false, true);
         renderLibraryTab();
+        renderHistoryList();
       } catch (err) {
         setStatus('#setupStatus', err.message, true);
       }
@@ -89,6 +90,7 @@
         setStatus('#setupStatus', `Rescanned: ${data.photoCount} photos found.`, false, true);
         renderLibraryTab();
         renderEditorTab();
+        renderHistoryList();
       } catch (err) {
         setStatus('#setupStatus', err.message, true);
       }
@@ -97,7 +99,7 @@
     $('#clearLibraryBtn').addEventListener('click', async () => {
       const confirmed = window.confirm(
         'This clears every photo and page this app has cataloged so you can start over. ' +
-        'Your real photo files are never touched. Continue?'
+        'Your real photo files are never touched, and a restore point is saved first. Continue?'
       );
       if (!confirmed) return;
       setStatus('#clearLibraryStatus', 'Clearing...', false);
@@ -112,10 +114,58 @@
         renderLibraryTab();
         renderEditorTab();
         renderExportTab();
+        renderHistoryList();
       } catch (err) {
         setStatus('#clearLibraryStatus', err.message, true);
       }
     });
+
+    $('#historyList').addEventListener('click', async (e) => {
+      const btn = e.target.closest('button[data-restore-id]');
+      if (!btn) return;
+      const id = btn.dataset.restoreId;
+      const confirmed = window.confirm(
+        'Restore this version? Your current state will be saved as its own restore point first, so this can be undone too.'
+      );
+      if (!confirmed) return;
+      try {
+        const data = await api('POST', `/api/history/${id}/restore`);
+        appState = data.state;
+        currentPageIndex = 0;
+        $('#sourceFolderInput').value = appState.sourceFolder || '';
+        renderLibraryTab();
+        renderEditorTab();
+        renderExportTab();
+        renderHistoryList();
+        flashSaved();
+      } catch (err) {
+        flashError(err.message);
+      }
+    });
+
+    renderHistoryList();
+  }
+
+  async function renderHistoryList() {
+    const container = $('#historyList');
+    try {
+      const data = await api('GET', '/api/history');
+      if (!data.snapshots || data.snapshots.length === 0) {
+        container.innerHTML = '<p class="exports-list-empty">No restore points yet.</p>';
+        return;
+      }
+      container.innerHTML = data.snapshots.map((s) => `
+        <div class="exports-list-item history-list-item">
+          <div>
+            <div>${new Date(s.createdAt).toLocaleString()}</div>
+            <div class="export-meta">${s.photoCount} photos, ${s.pageCount} pages${s.sourceFolder ? ' &middot; ' + escapeHtml(s.sourceFolder) : ''}</div>
+          </div>
+          <button data-restore-id="${s.id}">Restore</button>
+        </div>
+      `).join('');
+    } catch (err) {
+      container.innerHTML = '<p class="exports-list-empty">Could not load version history.</p>';
+    }
   }
 
   function setStatus(sel, msg, isError, isOk) {
@@ -268,6 +318,18 @@
       await applyPageSize(widthIn, heightIn);
     });
 
+    $('#layoutGapToggle').addEventListener('change', async (e) => {
+      const layoutGap = e.target.checked;
+      try {
+        const data = await api('POST', '/api/layout-gap', { layoutGap });
+        appState.layoutGap = data.layoutGap;
+        flashSaved();
+      } catch (err) {
+        flashError(err.message);
+      }
+      renderEditorCanvas();
+    });
+
     $('#pickerClose').addEventListener('click', closePicker);
     $('#pickerModal').addEventListener('click', (e) => {
       if (e.target === $('#pickerModal')) closePicker();
@@ -351,6 +413,7 @@
 
   function renderEditorTab() {
     $('#pageCountInput').value = appState.pages.length;
+    $('#layoutGapToggle').checked = appState.layoutGap !== false;
     syncPageSizeControls();
     renderEditorLibrary();
     renderEditorCanvas();
@@ -382,6 +445,103 @@
     stage.style.aspectRatio = `${widthIn} / ${heightIn}`;
   }
 
+  // Row layout for photo counts that don't use the adjustable-split grid
+  // (1-4): each entry lists how many photos sit in each row, left to right,
+  // top to bottom, all cells within a row equal width and all rows equal
+  // height. Must match LAYOUT_ROWS in server/pages.js exactly.
+  const LAYOUT_ROWS = {
+    5: [3, 2],
+    6: [3, 3],
+    7: [4, 3],
+    8: [4, 4]
+  };
+
+  function buildSlotElement(page, slot, idx) {
+    const slotEl = document.createElement('div');
+    slotEl.className = 'slot' + (slot.photoId ? ' filled' : '');
+    slotEl.dataset.slotIndex = idx;
+
+    if (slot.photoId) {
+      const photo = appState.photos.find((p) => p.id === slot.photoId);
+      const cropStyle = slot.crop
+        ? `position:absolute; left:${(-slot.crop.x / slot.crop.w * 100).toFixed(3)}%; top:${(-slot.crop.y / slot.crop.h * 100).toFixed(3)}%; width:${(100 / slot.crop.w).toFixed(3)}%; height:${(100 / slot.crop.h).toFixed(3)}%; object-fit:fill;`
+        : '';
+      slotEl.innerHTML = `
+        ${slot.hero ? '<span class="hero-tag">HERO</span>' : ''}
+        <img src="/api/thumb/${slot.photoId}" alt="${photo ? escapeHtml(photo.filename) : ''}" title="Click to view full size" style="${cropStyle}" />
+        <div class="slot-actions">
+          <button class="slot-crop-btn" title="Adjust crop">&#9986;</button>
+          <button class="hero-toggle-btn" title="Toggle hero">${slot.hero ? '&#9733;' : '&#9734;'}</button>
+          <button class="slot-library-btn" title="Pick from already-added photos">&#9638;</button>
+          <button class="slot-remove-btn" title="Remove photo, then add a new one">&times;</button>
+        </div>
+      `;
+      slotEl.querySelector('.slot-crop-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        openCropEditor(page.id, idx);
+      });
+      slotEl.querySelector('.hero-toggle-btn').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        await assignSlot(page.id, idx, { hero: !slot.hero });
+      });
+      slotEl.querySelector('.slot-library-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        openPicker(page.id, idx);
+      });
+      slotEl.querySelector('.slot-remove-btn').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        await assignSlot(page.id, idx, { remove: true });
+      });
+      slotEl.addEventListener('click', () => openLightbox(slot.photoId));
+    } else {
+      slotEl.innerHTML = `
+        <span class="add-photo-btn">
+          + Add Photo
+          <button class="browse-library-link">or pick from already-added photos</button>
+        </span>
+      `;
+      slotEl.querySelector('.browse-library-link').addEventListener('click', (e) => {
+        e.stopPropagation();
+        openPicker(page.id, idx);
+      });
+      slotEl.addEventListener('click', () => openSlotFileBrowser(page.id, idx));
+    }
+
+    slotEl.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      slotEl.classList.add('drag-over');
+    });
+    slotEl.addEventListener('dragleave', () => slotEl.classList.remove('drag-over'));
+    slotEl.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      slotEl.classList.remove('drag-over');
+      const photoId = e.dataTransfer.getData('text/plain');
+      if (photoId) await assignSlot(page.id, idx, { photoId });
+    });
+
+    return slotEl;
+  }
+
+  function buildRowsContainer(page, slotElements) {
+    const rows = LAYOUT_ROWS[page.layout];
+    const gapPx = appState.layoutGap ? 10 : 0;
+    const outer = document.createElement('div');
+    outer.className = 'page-rows';
+    outer.style.gap = `${gapPx}px`;
+    let idx = 0;
+    rows.forEach((count) => {
+      const rowEl = document.createElement('div');
+      rowEl.className = 'page-row';
+      rowEl.style.gap = `${gapPx}px`;
+      for (let c = 0; c < count; c++) {
+        rowEl.appendChild(slotElements[idx]);
+        idx++;
+      }
+      outer.appendChild(rowEl);
+    });
+    return outer;
+  }
+
   function renderEditorCanvas() {
     applyPageSizeToStage();
     const stage = $('#pageStage');
@@ -396,78 +556,96 @@
       return;
     }
 
-    const grid = document.createElement('div');
-    grid.className = `page-grid layout-${page.layout}`;
-
-    page.slots.forEach((slot, idx) => {
-      const slotEl = document.createElement('div');
-      slotEl.className = 'slot' + (slot.photoId ? ' filled' : '');
-      slotEl.dataset.slotIndex = idx;
-
-      if (slot.photoId) {
-        const photo = appState.photos.find((p) => p.id === slot.photoId);
-        const cropStyle = slot.crop
-          ? `position:absolute; left:${(-slot.crop.x / slot.crop.w * 100).toFixed(3)}%; top:${(-slot.crop.y / slot.crop.h * 100).toFixed(3)}%; width:${(100 / slot.crop.w).toFixed(3)}%; height:${(100 / slot.crop.h).toFixed(3)}%; object-fit:fill;`
-          : '';
-        slotEl.innerHTML = `
-          ${slot.hero ? '<span class="hero-tag">HERO</span>' : ''}
-          <img src="/api/thumb/${slot.photoId}" alt="${photo ? escapeHtml(photo.filename) : ''}" title="Click to view full size" style="${cropStyle}" />
-          <div class="slot-actions">
-            <button class="slot-crop-btn" title="Adjust crop">&#9986;</button>
-            <button class="hero-toggle-btn" title="Toggle hero">${slot.hero ? '&#9733;' : '&#9734;'}</button>
-            <button class="slot-library-btn" title="Pick from already-added photos">&#9638;</button>
-            <button class="slot-remove-btn" title="Remove photo, then add a new one">&times;</button>
-          </div>
-        `;
-        slotEl.querySelector('.slot-crop-btn').addEventListener('click', (e) => {
-          e.stopPropagation();
-          openCropEditor(page.id, idx);
-        });
-        slotEl.querySelector('.hero-toggle-btn').addEventListener('click', async (e) => {
-          e.stopPropagation();
-          await assignSlot(page.id, idx, { hero: !slot.hero });
-        });
-        slotEl.querySelector('.slot-library-btn').addEventListener('click', (e) => {
-          e.stopPropagation();
-          openPicker(page.id, idx);
-        });
-        slotEl.querySelector('.slot-remove-btn').addEventListener('click', async (e) => {
-          e.stopPropagation();
-          await assignSlot(page.id, idx, { remove: true });
-        });
-        slotEl.addEventListener('click', () => openLightbox(slot.photoId));
-      } else {
-        slotEl.innerHTML = `
-          <span class="add-photo-btn">
-            + Add Photo
-            <button class="browse-library-link">or pick from already-added photos</button>
-          </span>
-        `;
-        slotEl.querySelector('.browse-library-link').addEventListener('click', (e) => {
-          e.stopPropagation();
-          openPicker(page.id, idx);
-        });
-        slotEl.addEventListener('click', () => openSlotFileBrowser(page.id, idx));
-      }
-
-      slotEl.addEventListener('dragover', (e) => {
-        e.preventDefault();
-        slotEl.classList.add('drag-over');
-      });
-      slotEl.addEventListener('dragleave', () => slotEl.classList.remove('drag-over'));
-      slotEl.addEventListener('drop', async (e) => {
-        e.preventDefault();
-        slotEl.classList.remove('drag-over');
-        const photoId = e.dataTransfer.getData('text/plain');
-        if (photoId) await assignSlot(page.id, idx, { photoId });
-      });
-
-      grid.appendChild(slotEl);
-    });
+    const slotElements = page.slots.map((slot, idx) => buildSlotElement(page, slot, idx));
 
     stage.innerHTML = '';
-    stage.appendChild(grid);
+    if (LAYOUT_ROWS[page.layout]) {
+      stage.appendChild(buildRowsContainer(page, slotElements));
+    } else {
+      const grid = document.createElement('div');
+      grid.className = `page-grid layout-${page.layout}`;
+      applyGridTemplate(grid, page);
+      slotElements.forEach((el) => grid.appendChild(el));
+      stage.appendChild(grid);
+      renderSplitDividers(grid, page);
+    }
   }
+
+  function applyGridTemplate(grid, page) {
+    const gapPx = appState.layoutGap ? 10 : 0;
+    grid.style.gap = `${gapPx}px`;
+    const s = page.splits;
+    if (!s) {
+      grid.style.gridTemplateColumns = '1fr';
+      grid.style.gridTemplateRows = '1fr';
+      return;
+    }
+    grid.style.gridTemplateColumns = `${s.primary}fr ${1 - s.primary}fr`;
+    grid.style.gridTemplateRows = s.secondary !== undefined ? `${s.secondary}fr ${1 - s.secondary}fr` : '1fr';
+  }
+
+  function renderSplitDividers(grid, page) {
+    if (!page.splits) return;
+    const gapPx = appState.layoutGap ? 10 : 0;
+    const rect = grid.getBoundingClientRect();
+
+    const vertical = document.createElement('div');
+    vertical.className = 'split-divider vertical';
+    const leftPx = (rect.width - gapPx) * page.splits.primary + gapPx / 2;
+    vertical.style.left = `${(leftPx / rect.width) * 100}%`;
+    grid.appendChild(vertical);
+    wireDividerDrag(vertical, grid, page, 'primary');
+
+    if (page.splits.secondary !== undefined) {
+      const horizontal = document.createElement('div');
+      horizontal.className = 'split-divider horizontal';
+      const topPx = (rect.height - gapPx) * page.splits.secondary + gapPx / 2;
+      horizontal.style.top = `${(topPx / rect.height) * 100}%`;
+      if (page.layout === 3) {
+        const rightColLeftPx = (rect.width - gapPx) * page.splits.primary + gapPx;
+        horizontal.style.left = `${(rightColLeftPx / rect.width) * 100}%`;
+        horizontal.style.right = 'auto';
+        horizontal.style.width = `${100 - (rightColLeftPx / rect.width) * 100}%`;
+      }
+      grid.appendChild(horizontal);
+      wireDividerDrag(horizontal, grid, page, 'secondary');
+    }
+  }
+
+  function wireDividerDrag(el, grid, page, axis) {
+    el.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      el.classList.add('active');
+      const rect = grid.getBoundingClientRect();
+      const gapPx = appState.layoutGap ? 10 : 0;
+
+      const onMove = (moveEvent) => {
+        let frac;
+        if (axis === 'primary') {
+          frac = (moveEvent.clientX - rect.left - gapPx / 2) / (rect.width - gapPx);
+        } else {
+          frac = (moveEvent.clientY - rect.top - gapPx / 2) / (rect.height - gapPx);
+        }
+        frac = Math.min(0.85, Math.max(0.15, frac));
+        page.splits[axis] = frac;
+        renderEditorCanvas();
+      };
+      const onUp = async () => {
+        window.removeEventListener('mousemove', onMove);
+        window.removeEventListener('mouseup', onUp);
+        try {
+          await api('PUT', `/api/pages/${page.id}/splits`, { [axis]: page.splits[axis] });
+          flashSaved();
+        } catch (err) {
+          flashError(err.message);
+        }
+      };
+      window.addEventListener('mousemove', onMove);
+      window.addEventListener('mouseup', onUp);
+    });
+  }
+
+  let railDragSourceIdx = null;
 
   function renderPageRail() {
     const rail = $('#pageRail');
@@ -475,18 +653,74 @@
       const filled = page.slots.some((s) => s.photoId);
       const total = page.slots.length;
       const filledCount = page.slots.filter((s) => s.photoId).length;
-      return `<div class="rail-page ${idx === currentPageIndex ? 'current' : ''} ${filled ? 'filled' : ''}" data-idx="${idx}">
+      return `<div class="rail-page ${idx === currentPageIndex ? 'current' : ''} ${filled ? 'filled' : ''}" data-idx="${idx}" draggable="true">
         <span>${filledCount}/${total}</span>
         <span class="rail-label">Pg ${idx + 1}</span>
       </div>`;
     }).join('');
+
     rail.querySelectorAll('.rail-page').forEach((el) => {
       el.addEventListener('click', () => {
+        if (railDragSourceIdx !== null) return; // ignore the click a drag gesture ends with
         currentPageIndex = parseInt(el.dataset.idx, 10);
         renderEditorCanvas();
         renderPageRail();
       });
+
+      el.addEventListener('dragstart', (e) => {
+        railDragSourceIdx = parseInt(el.dataset.idx, 10);
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', String(railDragSourceIdx));
+      });
+
+      el.addEventListener('dragover', (e) => {
+        if (railDragSourceIdx === null) return;
+        e.preventDefault();
+        const rect = el.getBoundingClientRect();
+        const insertAfter = e.clientX - rect.left > rect.width / 2;
+        rail.querySelectorAll('.rail-page').forEach((p) => p.classList.remove('drop-before', 'drop-after'));
+        el.classList.add(insertAfter ? 'drop-after' : 'drop-before');
+      });
+
+      el.addEventListener('drop', async (e) => {
+        e.preventDefault();
+        const targetIdx = parseInt(el.dataset.idx, 10);
+        const rect = el.getBoundingClientRect();
+        const insertAfter = e.clientX - rect.left > rect.width / 2;
+        el.classList.remove('drop-before', 'drop-after');
+        if (railDragSourceIdx === null || railDragSourceIdx === targetIdx) return;
+        await reorderPages(railDragSourceIdx, targetIdx, insertAfter);
+      });
+
+      el.addEventListener('dragend', () => {
+        railDragSourceIdx = null;
+        rail.querySelectorAll('.rail-page').forEach((p) => p.classList.remove('drop-before', 'drop-after'));
+      });
     });
+  }
+
+  async function reorderPages(sourceIdx, targetIdx, insertAfter) {
+    const currentPageId = appState.pages[currentPageIndex] ? appState.pages[currentPageIndex].id : null;
+    const ids = appState.pages.map((p) => p.id);
+    const [movedId] = ids.splice(sourceIdx, 1);
+    let insertAt = targetIdx;
+    if (sourceIdx < targetIdx) insertAt -= 1;
+    if (insertAfter) insertAt += 1;
+    ids.splice(insertAt, 0, movedId);
+
+    try {
+      const data = await api('POST', '/api/pages/reorder', { order: ids });
+      appState.pages = data.pages;
+      flashSaved();
+    } catch (err) {
+      flashError(err.message);
+    }
+    if (currentPageId) {
+      const newIdx = appState.pages.findIndex((p) => p.id === currentPageId);
+      if (newIdx !== -1) currentPageIndex = newIdx;
+    }
+    renderEditorCanvas();
+    renderPageRail();
   }
 
   async function assignSlot(pageId, slotIndex, body) {
@@ -595,7 +829,7 @@
     const page = appState.pages.find((p) => p.id === pageId);
     const slot = page && page.slots[slotIndex];
     if (!slot || !slot.photoId) return;
-    const slotEl = document.querySelector(`.page-grid .slot[data-slot-index="${slotIndex}"]`);
+    const slotEl = document.querySelector(`#pageStage .slot[data-slot-index="${slotIndex}"]`);
     const bounds = slotEl.getBoundingClientRect();
     const slotAR = bounds.width / bounds.height;
 
@@ -762,6 +996,7 @@
     }
     if (!appState.exports) appState.exports = [];
     if (!appState.pageSize) appState.pageSize = { widthIn: 11, heightIn: 8.5 };
+    if (appState.layoutGap === undefined) appState.layoutGap = true;
 
     $('#sourceFolderInput').value = appState.sourceFolder || '';
     $('#destFolderInput').value = defaultDestFolder();

@@ -77,6 +77,7 @@ main { padding: 20px; max-width: 1500px; margin: 0 auto; }
 }
 .exports-list-item .export-meta { color: var(--text-muted); }
 .exports-list-empty { color: var(--text-muted); font-size: 13px; }
+.history-list-item { max-width: 640px; }
 
 label { display: block; margin-bottom: 12px; font-size: 13px; color: var(--text-muted); }
 input[type="text"], input[type="number"] {
@@ -194,15 +195,35 @@ button.primary:hover, button.danger:hover { filter: brightness(0.95); }
 
 .page-grid {
   display: grid;
-  gap: 10px;
+  position: relative;
   width: 100%;
   height: 100%;
 }
-.page-grid.layout-1 { grid-template-columns: 1fr; grid-template-rows: 1fr; }
-.page-grid.layout-2 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr; }
-.page-grid.layout-3 { grid-template-columns: 2fr 1fr; grid-template-rows: 1fr 1fr; }
+/* grid-template-columns/rows and gap are set inline per-page by JS, based on
+   that page's adjustable split ratios and the album's gap setting. */
 .page-grid.layout-3 .slot:nth-child(1) { grid-row: 1 / 3; }
-.page-grid.layout-4 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
+
+/* Layouts of 5-8 photos: equal-height rows of equal-width cells, gap set
+   inline by JS to match the album's gap setting. */
+.page-rows { display: flex; flex-direction: column; width: 100%; height: 100%; }
+.page-row { display: flex; flex: 1; min-height: 0; }
+.page-row .slot { flex: 1 1 0; min-width: 0; }
+
+.split-divider {
+  position: absolute;
+  z-index: 5;
+  background: transparent;
+}
+.split-divider.vertical { top: 0; bottom: 0; width: 14px; margin-left: -7px; cursor: col-resize; }
+.split-divider.horizontal { left: 0; right: 0; height: 14px; margin-top: -7px; cursor: row-resize; }
+.split-divider::after {
+  content: '';
+  position: absolute; background: var(--accent); opacity: 0; border-radius: 3px;
+  transition: opacity 0.1s;
+}
+.split-divider.vertical::after { top: 0; bottom: 0; left: 6px; width: 2px; }
+.split-divider.horizontal::after { left: 0; right: 0; top: 6px; height: 2px; }
+.split-divider:hover::after, .split-divider.active::after { opacity: 0.9; }
 
 .slot {
   position: relative;
@@ -213,7 +234,7 @@ button.primary:hover, button.danger:hover { filter: brightness(0.95); }
   display: flex; align-items: center; justify-content: center;
   cursor: pointer;
 }
-.slot.filled { border-style: solid; border-color: transparent; }
+.slot.filled { border: none; }
 .slot.drag-over { border-color: var(--accent); background: #ece2d3; }
 .slot img { width: 100%; height: 100%; object-fit: contain; display: block; background: #eee; }
 .slot .add-photo-btn {
@@ -256,6 +277,9 @@ button.primary:hover, button.danger:hover { filter: brightness(0.95); }
 .rail-page.current { border-color: var(--accent); }
 .rail-page.filled { background: #e6e1d8; }
 .rail-page .rail-label { position: absolute; bottom: 2px; left: 4px; font-size: 10px; }
+.rail-page[draggable="true"] { cursor: grab; }
+.rail-page.drop-before { box-shadow: inset 3px 0 0 0 var(--accent); }
+.rail-page.drop-after { box-shadow: inset -3px 0 0 0 var(--accent); }
 
 /* Modal */
 .modal-backdrop {

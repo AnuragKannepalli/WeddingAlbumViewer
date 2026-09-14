@@ -3,4 +3,5 @@ data/state.json
 data/cache/
 data/exports/
 data/uploads/
+data/history/
 *.log

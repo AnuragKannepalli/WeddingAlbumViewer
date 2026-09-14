@@ -3,43 +3,69 @@ const path = require('path');
 const PDFDocument = require('pdfkit');
 const sharp = require('sharp');
 const { getResizedBuffer, getCroppedBuffer } = require('./images');
+const { LAYOUT_ROWS } = require('./pages');
 
 const MARGIN = 30;
-const GAP = 10;
+const DEFAULT_SPLITS = {
+  2: { primary: 0.5 },
+  3: { primary: 2 / 3, secondary: 0.5 },
+  4: { primary: 0.5, secondary: 0.5 }
+};
 
-function layoutRects(layout, x, y, w, h) {
+function layoutRects(layout, x, y, w, h, gap, splits) {
+  const s = splits || DEFAULT_SPLITS[layout];
   switch (layout) {
     case 1:
       return [{ x, y, w, h }];
     case 2: {
-      const halfW = (w - GAP) / 2;
+      const leftW = (w - gap) * s.primary;
+      const rightW = w - gap - leftW;
       return [
-        { x, y, w: halfW, h },
-        { x: x + halfW + GAP, y, w: halfW, h }
+        { x, y, w: leftW, h },
+        { x: x + leftW + gap, y, w: rightW, h }
       ];
     }
     case 3: {
-      const bigW = (w - GAP) * (2 / 3);
-      const smallW = w - GAP - bigW;
-      const smallH = (h - GAP) / 2;
+      const bigW = (w - gap) * s.primary;
+      const smallW = w - gap - bigW;
+      const topH = (h - gap) * s.secondary;
+      const bottomH = h - gap - topH;
       return [
         { x, y, w: bigW, h },
-        { x: x + bigW + GAP, y, w: smallW, h: smallH },
-        { x: x + bigW + GAP, y: y + smallH + GAP, w: smallW, h: smallH }
+        { x: x + bigW + gap, y, w: smallW, h: topH },
+        { x: x + bigW + gap, y: y + topH + gap, w: smallW, h: bottomH }
       ];
     }
     case 4: {
-      const halfW = (w - GAP) / 2;
-      const halfH = (h - GAP) / 2;
+      const leftW = (w - gap) * s.primary;
+      const rightW = w - gap - leftW;
+      const topH = (h - gap) * s.secondary;
+      const bottomH = h - gap - topH;
       return [
-        { x, y, w: halfW, h: halfH },
-        { x: x + halfW + GAP, y, w: halfW, h: halfH },
-        { x, y: y + halfH + GAP, w: halfW, h: halfH },
-        { x: x + halfW + GAP, y: y + halfH + GAP, w: halfW, h: halfH }
+        { x, y, w: leftW, h: topH },
+        { x: x + leftW + gap, y, w: rightW, h: topH },
+        { x, y: y + topH + gap, w: leftW, h: bottomH },
+        { x: x + leftW + gap, y: y + topH + gap, w: rightW, h: bottomH }
       ];
     }
-    default:
-      return [{ x, y, w, h }];
+    default: {
+      const rows = LAYOUT_ROWS[layout];
+      if (!rows) return [{ x, y, w, h }];
+      const rowCount = rows.length;
+      const rowH = (h - gap * (rowCount - 1)) / rowCount;
+      const rects = [];
+      let curY = y;
+      for (const cols of rows) {
+        const colW = (w - gap * (cols - 1)) / cols;
+        let curX = x;
+        for (let c = 0; c < cols; c++) {
+          rects.push({ x: curX, y: curY, w: colW, h: rowH });
+          curX += colW + gap;
+        }
+        curY += rowH + gap;
+      }
+      return rects;
+    }
   }
 }
 
@@ -102,6 +128,7 @@ async function exportPdf(state, destPath) {
 
   const contentW = PAGE_W - MARGIN * 2;
   const contentH = PAGE_H - MARGIN * 2 - 24; // leave room for page label
+  const gap = state.layoutGap === false ? 0 : 10;
 
   for (let pageIdx = 0; pageIdx < state.pages.length; pageIdx++) {
     const page = state.pages[pageIdx];
@@ -109,7 +136,7 @@ async function exportPdf(state, destPath) {
 
     doc.rect(0, 0, PAGE_W, PAGE_H).fill('#ffffff');
 
-    const rects = layoutRects(page.layout, MARGIN, MARGIN, contentW, contentH);
+    const rects = layoutRects(page.layout, MARGIN, MARGIN, contentW, contentH, gap, page.splits);
     for (let i = 0; i < page.slots.length; i++) {
       const slot = page.slots[i];
       const rect = rects[i];

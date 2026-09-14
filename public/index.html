@@ -40,6 +40,11 @@
       <button id="clearLibraryBtn" class="danger">Clear Library &amp; Start Over</button>
       <p id="clearLibraryStatus" class="status"></p>
     </div>
+    <div class="panel-card">
+      <h2>Version History</h2>
+      <p class="hint">A restore point is saved automatically before scanning a new folder, rescanning, or clearing the library — so any of those can be undone. Restoring one also saves your current state as a restore point first, so restoring is itself undoable.</p>
+      <div id="historyList"></div>
+    </div>
   </section>
 
   <!-- LIBRARY TAB -->
@@ -75,12 +80,18 @@
             <button data-layout="2">2</button>
             <button data-layout="3">3</button>
             <button data-layout="4">4</button>
+            <button data-layout="5">5</button>
+            <button data-layout="6">6</button>
+            <button data-layout="7">7</button>
+            <button data-layout="8">8</button>
           </div>
+          <label class="checkbox"><input type="checkbox" id="layoutGapToggle" /> Gap between photos</label>
           <div class="page-nav-btns">
             <button id="pageMoveUp" title="Move page earlier">&#8593;</button>
             <button id="pageMoveDown" title="Move page later">&#8595;</button>
           </div>
         </div>
+        <p class="hint">Drag the divider lines on the page below to resize how much space each photo gets.</p>
         <div class="editor-canvas-header">
           <label>Sheet size
             <select id="pageSizePreset">

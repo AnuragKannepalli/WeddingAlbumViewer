@@ -4,10 +4,10 @@ const fs = require('fs-extra');
 const crypto = require('crypto');
 const multer = require('multer');
 
-const { loadState, saveState, DATA_DIR } = require('./store');
+const { loadState, saveState, snapshotState, listSnapshots, loadSnapshot, DATA_DIR } = require('./store');
 const { scanFolder, mergeScannedPhotos, photoIdForPath } = require('./scanner');
 const { getCachedImage } = require('./images');
-const { makePage, resizeSlotsForLayout, nextPageId } = require('./pages');
+const { makePage, resizeSlotsForLayout, nextPageId, defaultSplitsForLayout } = require('./pages');
 const { exportForPhotographer } = require('./exporter');
 const { exportPdf } = require('./pdfExporter');
 
@@ -29,6 +29,12 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 let state = loadState();
 if (!state.exports) state.exports = [];
 if (!state.pageSize) state.pageSize = { widthIn: 11, heightIn: 8.5 };
+if (state.layoutGap === undefined) state.layoutGap = true;
+
+// Back-fill pages saved before adjustable splits existed.
+for (const page of state.pages) {
+  if (page.splits === undefined) page.splits = defaultSplitsForLayout(page.layout);
+}
 
 // Back-fill photo records saved before absPath/source existed on them, so
 // existing albums keep working (same ids, same slot assignments) after
@@ -73,6 +79,7 @@ app.post('/api/setup', (req, res) => {
   const { sourceFolder } = req.body;
   try {
     const scanned = scanFolder(sourceFolder);
+    snapshotState(state);
     state.sourceFolder = sourceFolder;
     state.photos = mergeScannedPhotos(state.photos, scanned);
     state.lastScan = new Date().toISOString();
@@ -89,6 +96,7 @@ app.post('/api/rescan', (req, res) => {
   }
   try {
     const scanned = scanFolder(state.sourceFolder);
+    snapshotState(state);
     const stillPresentIds = new Set([...scanned.map((p) => p.id), ...state.photos.filter((p) => p.source === 'upload').map((p) => p.id)]);
     state.photos = mergeScannedPhotos(state.photos, scanned);
     // Drop slot references to photos that no longer exist on disk.
@@ -146,6 +154,7 @@ app.post('/api/upload', upload.array('photos', 50), (req, res) => {
 // added via "Add from my computer" are physical copies this app made in
 // data/uploads/, so those files are removed too as part of starting over.
 app.post('/api/reset', async (req, res) => {
+  snapshotState(state);
   state.sourceFolder = null;
   state.photos = [];
   state.pages = [];
@@ -157,6 +166,36 @@ app.post('/api/reset', async (req, res) => {
   }
   persist();
   res.json({ ok: true, state });
+});
+
+// ---- Version history ----
+// A restore point is taken automatically before any action that replaces
+// or clears the photo catalog (switching source folders, rescanning,
+// clearing the library), so an unintended change is never unrecoverable.
+
+app.get('/api/history', (req, res) => {
+  try {
+    res.json({ ok: true, snapshots: listSnapshots() });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/api/history/:id/restore', (req, res) => {
+  try {
+    const snapshot = loadSnapshot(req.params.id);
+    snapshotState(state); // the current state becomes its own restore point first
+    state = snapshot;
+    if (!state.exports) state.exports = [];
+    if (state.layoutGap === undefined) state.layoutGap = true;
+    for (const page of state.pages) {
+      if (page.splits === undefined) page.splits = defaultSplitsForLayout(page.layout);
+    }
+    persist();
+    res.json({ ok: true, state });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err.message });
+  }
 });
 
 // ---- Images ----
@@ -207,6 +246,12 @@ app.post('/api/page-size', (req, res) => {
   res.json({ ok: true, pageSize: state.pageSize });
 });
 
+app.post('/api/layout-gap', (req, res) => {
+  state.layoutGap = !!req.body.layoutGap;
+  persist();
+  res.json({ ok: true, layoutGap: state.layoutGap });
+});
+
 // ---- Pages ----
 
 app.post('/api/pages/count', (req, res) => {
@@ -229,6 +274,23 @@ app.put('/api/pages/:pageId/layout', (req, res) => {
   if (!page) return res.status(404).json({ ok: false, error: 'Page not found' });
   page.slots = resizeSlotsForLayout(page.slots, layout);
   page.layout = layout;
+  page.splits = defaultSplitsForLayout(layout);
+  persist();
+  res.json({ ok: true, page });
+});
+
+app.put('/api/pages/:pageId/splits', (req, res) => {
+  const page = state.pages.find((p) => p.id === req.params.pageId);
+  if (!page) return res.status(404).json({ ok: false, error: 'Page not found' });
+  const { primary, secondary } = req.body;
+  if (!page.splits) {
+    return res.status(400).json({ ok: false, error: 'This layout has no adjustable split.' });
+  }
+  const clamp = (v) => Math.min(0.85, Math.max(0.15, v));
+  if (primary !== undefined) page.splits.primary = clamp(parseFloat(primary));
+  if (secondary !== undefined && page.splits.secondary !== undefined) {
+    page.splits.secondary = clamp(parseFloat(secondary));
+  }
   persist();
   res.json({ ok: true, page });
 });
@@ -264,6 +326,23 @@ app.post('/api/pages/move', (req, res) => {
     return res.json({ ok: true, pages: state.pages });
   }
   [state.pages[idx], state.pages[swapWith]] = [state.pages[swapWith], state.pages[idx]];
+  persist();
+  res.json({ ok: true, pages: state.pages });
+});
+
+// Reorders pages to an arbitrary new order (used by drag-to-reorder in the
+// page rail). `order` must list every existing page id exactly once.
+app.post('/api/pages/reorder', (req, res) => {
+  const { order } = req.body;
+  if (!Array.isArray(order)) {
+    return res.status(400).json({ ok: false, error: 'order must be an array of page ids.' });
+  }
+  const byId = new Map(state.pages.map((p) => [p.id, p]));
+  const isValid = order.length === state.pages.length && order.every((id) => byId.has(id));
+  if (!isValid) {
+    return res.status(400).json({ ok: false, error: 'order must include every existing page exactly once.' });
+  }
+  state.pages = order.map((id) => byId.get(id));
   persist();
   res.json({ ok: true, pages: state.pages });
 });
