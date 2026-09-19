@@ -8,6 +8,7 @@
     "start": "node server/index.js"
   },
   "dependencies": {
+    "@azure/msal-node": "^6.0.1",
     "express": "^4.19.2",
     "fs-extra": "^11.2.0",
     "multer": "^2.0.1",

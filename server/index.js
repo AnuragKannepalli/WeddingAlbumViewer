@@ -10,6 +10,7 @@ const { getCachedImage } = require('./images');
 const { makePage, resizeSlotsForLayout, nextPageId, defaultSplitsForLayout } = require('./pages');
 const { exportForPhotographer } = require('./exporter');
 const { exportPdf } = require('./pdfExporter');
+const onedrive = require('./onedrive');
 
 const app = express();
 const PORT = process.env.PORT || 4173;
@@ -30,6 +31,7 @@ let state = loadState();
 if (!state.exports) state.exports = [];
 if (!state.pageSize) state.pageSize = { widthIn: 11, heightIn: 8.5 };
 if (state.layoutGap === undefined) state.layoutGap = true;
+if (!state.oneDrive) state.oneDrive = { clientId: null };
 
 // Back-fill pages saved before adjustable splits existed.
 for (const page of state.pages) {
@@ -56,6 +58,17 @@ function timestampFolderName() {
   const pad = (n) => String(n).padStart(2, '0');
   return `Wedding-Album-Final_${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;
 }
+
+const CONTENT_TYPE_EXT = {
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/webp': '.webp',
+  'image/heic': '.heic',
+  'image/heif': '.heif',
+  'image/gif': '.gif',
+  'image/bmp': '.bmp',
+  'image/tiff': '.tiff'
+};
 
 const uploadsDir = path.join(DATA_DIR, 'uploads');
 const upload = multer({
@@ -148,6 +161,198 @@ app.post('/api/upload', upload.array('photos', 50), (req, res) => {
   res.json({ ok: true, added, state });
 });
 
+// Saves already-downloaded image bytes as a new library photo (used by both
+// the drag-a-link import below and the OneDrive browser import), and, if a
+// slot was specified, places it there directly.
+async function addDownloadedPhoto(buffer, filename, pageId, slotIndex) {
+  const ext = path.extname(filename || '') || '.jpg';
+  const unique = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
+  const destPath = path.join(uploadsDir, `${unique}${ext}`);
+  await fs.ensureDir(uploadsDir);
+  await fs.writeFile(destPath, buffer);
+
+  const id = photoIdForPath(destPath);
+  const record = {
+    id,
+    absPath: destPath,
+    relPath: null,
+    filename: filename || path.basename(destPath),
+    size: buffer.length,
+    mtimeMs: Date.now(),
+    burstGroup: null,
+    possibleDuplicate: false,
+    favorite: false,
+    source: 'upload'
+  };
+  state.photos.push(record);
+
+  let page = null;
+  if (pageId !== undefined && slotIndex !== undefined) {
+    page = state.pages.find((p) => p.id === pageId) || null;
+    if (page) {
+      const idx = parseInt(slotIndex, 10);
+      if (idx >= 0 && idx < page.slots.length) {
+        page.slots[idx].photoId = id;
+        page.slots[idx].crop = null;
+      }
+    }
+  }
+  return { record, page };
+}
+
+// Lets you drag a photo straight out of a OneDrive browser tab and drop it
+// onto a page slot. A web page can't hand our JS the actual file bytes for
+// something dragged from another origin -- but OneDrive's web UI (like
+// Gmail/Google Drive) sets a "DownloadURL" drag payload: a short-lived,
+// self-authenticating link meant for exactly this kind of drag-out, so the
+// browser's JS just passes that URL here and the server fetches it directly
+// (no cookies needed, which is also why it expires quickly -- if it fails,
+// dragging again from OneDrive gets a fresh one).
+app.post('/api/import-url', async (req, res) => {
+  const { url, filename, pageId, slotIndex } = req.body;
+  if (!url || !/^https?:\/\//i.test(url)) {
+    return res.status(400).json({ ok: false, error: 'A valid http(s) URL is required.' });
+  }
+  try {
+    const response = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; WeddingAlbumSelector/1.0)' }
+    });
+    if (!response.ok) {
+      throw new Error(`That link didn't return a photo (HTTP ${response.status}). OneDrive drag links expire quickly -- try dragging it again.`);
+    }
+    const contentType = (response.headers.get('content-type') || '').split(';')[0].trim();
+    if (!contentType.startsWith('image/')) {
+      throw new Error('That link did not point to an image file.');
+    }
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const name = filename || `photo${CONTENT_TYPE_EXT[contentType] || '.jpg'}`;
+    const { record, page } = await addDownloadedPhoto(buffer, name, pageId, slotIndex);
+    persist();
+    res.json({ ok: true, photo: record, page });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err.message });
+  }
+});
+
+// ---- OneDrive integration ----
+// Lets you sign in with your own Microsoft account and browse/import photos
+// straight from OneDrive's web app, since dragging out of onedrive.com
+// directly doesn't work (its web UI only shares an internal item reference
+// on drag, not an actual file or URL -- see the comment above import-url).
+
+app.get('/api/onedrive/status', async (req, res) => {
+  try {
+    const clientId = state.oneDrive.clientId;
+    if (!clientId) return res.json({ ok: true, configured: false, connected: false, account: null });
+    const account = await onedrive.getAccount(clientId);
+    res.json({ ok: true, configured: true, connected: !!account, account: account ? account.username : null });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/api/onedrive/config', (req, res) => {
+  state.oneDrive.clientId = (req.body.clientId || '').trim() || null;
+  persist();
+  res.json({ ok: true, oneDrive: state.oneDrive });
+});
+
+app.post('/api/onedrive/logout', async (req, res) => {
+  try {
+    await onedrive.signOut(state.oneDrive.clientId);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/auth/onedrive/login', async (req, res) => {
+  const clientId = state.oneDrive.clientId;
+  if (!clientId) return res.status(400).send('Set a OneDrive Client ID on the Setup tab first, then try connecting again.');
+  try {
+    const url = await onedrive.getAuthUrl(clientId, PORT);
+    res.redirect(url);
+  } catch (err) {
+    res.status(500).send(`Could not start OneDrive sign-in: ${err.message}`);
+  }
+});
+
+app.get('/auth/onedrive/callback', async (req, res) => {
+  try {
+    if (req.query.error) throw new Error(req.query.error_description || req.query.error);
+    await onedrive.handleCallback(req.query.code, PORT);
+    res.redirect('/?onedrive=connected');
+  } catch (err) {
+    res.redirect(`/?onedrive=error&msg=${encodeURIComponent(err.message)}`);
+  }
+});
+
+app.get('/api/onedrive/browse', async (req, res) => {
+  try {
+    const clientId = state.oneDrive.clientId;
+    const token = await onedrive.getAccessToken(clientId);
+    const folderPath = req.query.id ? `/me/drive/items/${req.query.id}/children` : '/me/drive/root/children';
+    const response = await onedrive.graphFetch(token, `${folderPath}?$top=200&$select=id,name,folder,file,image`);
+    if (!response.ok) throw new Error(`OneDrive returned an error (HTTP ${response.status}).`);
+    const data = await response.json();
+    const items = (data.value || [])
+      .filter((it) => it.folder || (it.file && it.image))
+      .map((it) => ({ id: it.id, name: it.name, isFolder: !!it.folder }));
+    res.json({ ok: true, items });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/onedrive/thumb/:itemId', async (req, res) => {
+  try {
+    const clientId = state.oneDrive.clientId;
+    const token = await onedrive.getAccessToken(clientId);
+    const response = await onedrive.graphFetch(token, `/me/drive/items/${req.params.itemId}/thumbnails/0/medium/content`);
+    if (!response.ok) return res.status(404).end();
+    res.set('Content-Type', response.headers.get('content-type') || 'image/jpeg');
+    res.send(Buffer.from(await response.arrayBuffer()));
+  } catch (err) {
+    res.status(500).end();
+  }
+});
+
+// Downloads the full-resolution original(s) for the given OneDrive item ids
+// and adds them to the library, same as any other imported photo.
+app.post('/api/onedrive/import', async (req, res) => {
+  try {
+    const clientId = state.oneDrive.clientId;
+    const { itemIds, pageId, slotIndex } = req.body;
+    if (!Array.isArray(itemIds) || itemIds.length === 0) {
+      return res.status(400).json({ ok: false, error: 'No photos selected.' });
+    }
+    const token = await onedrive.getAccessToken(clientId);
+    const added = [];
+    let page = null;
+    for (const itemId of itemIds) {
+      const metaRes = await onedrive.graphFetch(token, `/me/drive/items/${itemId}?$select=name,@microsoft.graph.downloadUrl`);
+      if (!metaRes.ok) continue;
+      const meta = await metaRes.json();
+      const downloadUrl = meta['@microsoft.graph.downloadUrl'];
+      if (!downloadUrl) continue;
+      const fileRes = await fetch(downloadUrl); // pre-authenticated by Graph, no Bearer header needed
+      if (!fileRes.ok) continue;
+      const buffer = Buffer.from(await fileRes.arrayBuffer());
+      const isFirst = added.length === 0;
+      const result = await addDownloadedPhoto(buffer, meta.name, isFirst ? pageId : undefined, isFirst ? slotIndex : undefined);
+      added.push(result.record);
+      if (result.page) page = result.page;
+    }
+    if (added.length === 0) {
+      return res.status(400).json({ ok: false, error: 'Could not download any of the selected photos.' });
+    }
+    persist();
+    res.json({ ok: true, added, page });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err.message });
+  }
+});
+
 // Clears the app's photo catalog and album layout so a new source folder can
 // be scanned fresh. This never touches your original synced photos -- it
 // only forgets what the app has recorded in state.json. Photos individually
@@ -188,6 +393,7 @@ app.post('/api/history/:id/restore', (req, res) => {
     state = snapshot;
     if (!state.exports) state.exports = [];
     if (state.layoutGap === undefined) state.layoutGap = true;
+    if (!state.oneDrive) state.oneDrive = { clientId: null };
     for (const page of state.pages) {
       if (page.splits === undefined) page.splits = defaultSplitsForLayout(page.layout);
     }

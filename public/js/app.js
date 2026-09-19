@@ -144,6 +144,52 @@
     });
 
     renderHistoryList();
+
+    $('#oneDriveSaveClientIdBtn').addEventListener('click', async () => {
+      const clientId = $('#oneDriveClientIdInput').value.trim();
+      try {
+        await api('POST', '/api/onedrive/config', { clientId });
+        setStatus('#oneDriveStatus', 'Client ID saved.', false, true);
+        renderOneDriveStatus();
+      } catch (err) {
+        setStatus('#oneDriveStatus', err.message, true);
+      }
+    });
+
+    $('#oneDriveConnectBtn').addEventListener('click', () => {
+      window.location.href = '/auth/onedrive/login';
+    });
+
+    $('#oneDriveDisconnectBtn').addEventListener('click', async () => {
+      try {
+        await api('POST', '/api/onedrive/logout');
+        setStatus('#oneDriveStatus', 'Disconnected.', false, true);
+        renderOneDriveStatus();
+      } catch (err) {
+        setStatus('#oneDriveStatus', err.message, true);
+      }
+    });
+
+    renderOneDriveStatus();
+  }
+
+  async function renderOneDriveStatus() {
+    try {
+      const data = await api('GET', '/api/onedrive/status');
+      $('#oneDriveClientIdInput').value = appState.oneDrive && appState.oneDrive.clientId ? appState.oneDrive.clientId : '';
+      $('#oneDriveConnectBtn').hidden = data.connected;
+      $('#oneDriveConnectBtn').disabled = !data.configured;
+      $('#oneDriveDisconnectBtn').hidden = !data.connected;
+      if (data.connected) {
+        setStatus('#oneDriveStatus', `Connected as ${data.account}.`, false, true);
+      } else if (data.configured) {
+        setStatus('#oneDriveStatus', 'Client ID saved. Click "Connect OneDrive" to sign in.', false);
+      } else {
+        setStatus('#oneDriveStatus', 'Not set up yet.', false);
+      }
+    } catch (err) {
+      setStatus('#oneDriveStatus', 'Could not check OneDrive status.', true);
+    }
   }
 
   async function renderHistoryList() {
@@ -456,6 +502,78 @@
     8: [4, 4]
   };
 
+  // A photo dragged out of another browser tab (e.g. onedrive.com) never
+  // gives our JS the actual file -- only a URL. Chromium-based browsers
+  // carry that as a "DownloadURL" entry formatted "mime:filename:url"
+  // (the same mechanism sites use to let you drag a file to your Desktop);
+  // text/uri-list and an <img> tag in text/html are fallbacks other sources
+  // may use instead. Returns { url, filename } or null if this wasn't an
+  // external image drag at all.
+  function extractExternalImageDrag(dt) {
+    const downloadUrl = dt.getData('DownloadURL');
+    if (downloadUrl) {
+      const firstColon = downloadUrl.indexOf(':');
+      const secondColon = downloadUrl.indexOf(':', firstColon + 1);
+      if (firstColon !== -1 && secondColon !== -1) {
+        const url = downloadUrl.slice(secondColon + 1);
+        const filename = downloadUrl.slice(firstColon + 1, secondColon);
+        if (/^https?:\/\//i.test(url)) return { url, filename };
+      }
+    }
+    const uriList = dt.getData('text/uri-list');
+    if (uriList) {
+      const line = uriList.split('\n').map((s) => s.trim()).find((s) => s && !s.startsWith('#'));
+      if (line && /^https?:\/\//i.test(line)) return { url: line, filename: null };
+    }
+    const html = dt.getData('text/html');
+    if (html) {
+      const match = html.match(/<img[^>]+src=["']([^"']+)["']/i);
+      if (match && /^https?:\/\//i.test(match[1])) return { url: match[1], filename: null };
+    }
+    const plain = dt.getData('text/plain');
+    if (plain && /^https?:\/\//i.test(plain.trim())) return { url: plain.trim(), filename: null };
+    return null;
+  }
+
+  async function importFileIntoSlot(pageId, slotIndex, file, slotEl) {
+    const prevHtml = slotEl.innerHTML;
+    slotEl.innerHTML = '<span class="add-photo-btn">Adding photo&hellip;</span>';
+    const formData = new FormData();
+    formData.append('photos', file);
+    try {
+      const data = await api('POST', '/api/upload', formData);
+      appState.photos.push(...data.added);
+      if (data.added[0]) {
+        await assignSlot(pageId, slotIndex, { photoId: data.added[0].id });
+      } else {
+        slotEl.innerHTML = prevHtml;
+      }
+    } catch (err) {
+      slotEl.innerHTML = prevHtml;
+      flashError(`Couldn't add that photo: ${err.message}`);
+    }
+  }
+
+  async function importUrlIntoSlot(pageId, slotIndex, { url, filename }, slotEl) {
+    const prevHtml = slotEl.innerHTML;
+    slotEl.innerHTML = '<span class="add-photo-btn">Downloading from OneDrive&hellip;</span>';
+    try {
+      const data = await api('POST', '/api/import-url', { url, filename, pageId, slotIndex });
+      appState.photos.push(data.photo);
+      if (data.page) {
+        const pageIdx = appState.pages.findIndex((p) => p.id === pageId);
+        if (pageIdx !== -1) appState.pages[pageIdx] = data.page;
+      }
+      renderLibraryTab();
+      renderEditorLibrary();
+      renderEditorCanvas();
+      flashSaved();
+    } catch (err) {
+      slotEl.innerHTML = prevHtml;
+      flashError(`Couldn't import that photo: ${err.message}`);
+    }
+  }
+
   function buildSlotElement(page, slot, idx) {
     const slotEl = document.createElement('div');
     slotEl.className = 'slot' + (slot.photoId ? ' filled' : '');
@@ -515,8 +633,25 @@
     slotEl.addEventListener('drop', async (e) => {
       e.preventDefault();
       slotEl.classList.remove('drag-over');
+
+      // A drag from File Explorer (or any source that hands over a real
+      // file) arrives here -- upload it directly, no server round-trip for
+      // a URL needed. (OneDrive's own web UI does NOT do this: it only
+      // shares internal item references meaningful to other Microsoft 365
+      // apps, not an actual file or URL, so dragging straight from
+      // onedrive.com can't be supported this way -- see hint text above.)
+      if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+        await importFileIntoSlot(page.id, idx, e.dataTransfer.files[0], slotEl);
+        return;
+      }
+
       const photoId = e.dataTransfer.getData('text/plain');
-      if (photoId) await assignSlot(page.id, idx, { photoId });
+      if (photoId && appState.photos.some((p) => p.id === photoId)) {
+        await assignSlot(page.id, idx, { photoId });
+        return;
+      }
+      const external = extractExternalImageDrag(e.dataTransfer);
+      if (external) await importUrlIntoSlot(page.id, idx, external, slotEl);
     });
 
     return slotEl;
@@ -779,6 +914,158 @@
     });
   }
 
+  // ---------------- OneDrive browser modal ----------------
+  // OneDrive's own web page can't be dragged from directly (see the comment
+  // on the slot drop handler above), so this is a real in-app file browser
+  // that talks to Microsoft Graph once you've connected your account on the
+  // Setup tab: navigate folders, pick photos, download the originals.
+
+  let oneDriveState = null; // { crumbs: [{id, name}], selected: Set<id>, items: [], target: {pageId, slotIndex} | null }
+
+  async function openOneDriveBrowser(pageId, slotIndex) {
+    let status;
+    try {
+      status = await api('GET', '/api/onedrive/status');
+    } catch (err) {
+      window.alert('Could not check OneDrive status. Is the app still running?');
+      return;
+    }
+    if (!status.connected) {
+      window.alert('Connect OneDrive first: go to the Setup tab, save your Client ID, and click "Connect OneDrive".');
+      return;
+    }
+    oneDriveState = {
+      crumbs: [{ id: null, name: 'OneDrive' }],
+      selected: new Set(),
+      items: [],
+      target: pageId !== undefined && pageId !== null ? { pageId, slotIndex } : null
+    };
+    $('#oneDriveModal').classList.add('active');
+    await loadOneDriveFolder(null);
+  }
+
+  function closeOneDriveModal() {
+    $('#oneDriveModal').classList.remove('active');
+    oneDriveState = null;
+  }
+
+  async function loadOneDriveFolder(folderId) {
+    setStatus('#oneDriveModalStatus', 'Loading...', false);
+    $('#oneDriveGrid').innerHTML = '';
+    try {
+      const query = folderId ? `?id=${encodeURIComponent(folderId)}` : '';
+      const data = await api('GET', `/api/onedrive/browse${query}`);
+      oneDriveState.items = data.items;
+      setStatus('#oneDriveModalStatus', '', false);
+      renderOneDriveGrid();
+    } catch (err) {
+      setStatus('#oneDriveModalStatus', err.message, true);
+    }
+    renderOneDriveBreadcrumbs();
+  }
+
+  function renderOneDriveBreadcrumbs() {
+    const el = $('#oneDriveBreadcrumbs');
+    el.innerHTML = oneDriveState.crumbs.map((c, i) => {
+      const isLast = i === oneDriveState.crumbs.length - 1;
+      const sep = i > 0 ? '<span class="crumb-sep">/</span>' : '';
+      return `${sep}<button data-crumb-idx="${i}" ${isLast ? 'disabled' : ''}>${escapeHtml(c.name)}</button>`;
+    }).join('');
+    el.querySelectorAll('button[data-crumb-idx]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const idx = parseInt(btn.dataset.crumbIdx, 10);
+        oneDriveState.crumbs = oneDriveState.crumbs.slice(0, idx + 1);
+        oneDriveState.selected.clear();
+        updateOneDriveSelectedCount();
+        await loadOneDriveFolder(oneDriveState.crumbs[idx].id);
+      });
+    });
+  }
+
+  function renderOneDriveGrid() {
+    const grid = $('#oneDriveGrid');
+    grid.innerHTML = oneDriveState.items.map((item) => {
+      if (item.isFolder) {
+        return `<div class="photo-card onedrive-tile folder" data-id="${item.id}" data-name="${escapeHtml(item.name)}">
+          <span>&#128193;</span>
+          <span class="folder-name">${escapeHtml(item.name)}</span>
+        </div>`;
+      }
+      const selected = oneDriveState.selected.has(item.id);
+      return `<div class="photo-card onedrive-tile photo ${selected ? 'selected' : ''}" data-id="${item.id}">
+        <img src="/api/onedrive/thumb/${item.id}" alt="${escapeHtml(item.name)}" loading="lazy" />
+        <span class="select-check">&#10003;</span>
+      </div>`;
+    }).join('');
+
+    grid.querySelectorAll('.onedrive-tile.folder').forEach((tile) => {
+      tile.addEventListener('click', async () => {
+        oneDriveState.crumbs.push({ id: tile.dataset.id, name: tile.dataset.name });
+        await loadOneDriveFolder(tile.dataset.id);
+      });
+    });
+    grid.querySelectorAll('.onedrive-tile.photo').forEach((tile) => {
+      tile.addEventListener('click', () => {
+        const id = tile.dataset.id;
+        if (oneDriveState.selected.has(id)) {
+          oneDriveState.selected.delete(id);
+          tile.classList.remove('selected');
+        } else {
+          oneDriveState.selected.add(id);
+          tile.classList.add('selected');
+        }
+        updateOneDriveSelectedCount();
+      });
+    });
+    updateOneDriveSelectedCount();
+  }
+
+  function updateOneDriveSelectedCount() {
+    const n = oneDriveState.selected.size;
+    $('#oneDriveSelectedCount').textContent = n === 0 ? 'No photos selected' : `${n} photo${n === 1 ? '' : 's'} selected`;
+  }
+
+  async function importSelectedOneDrivePhotos() {
+    if (!oneDriveState || oneDriveState.selected.size === 0) return;
+    const itemIds = Array.from(oneDriveState.selected);
+    setStatus('#oneDriveModalStatus', `Adding ${itemIds.length} photo(s)...`, false);
+    try {
+      const body = { itemIds };
+      if (oneDriveState.target) {
+        body.pageId = oneDriveState.target.pageId;
+        body.slotIndex = oneDriveState.target.slotIndex;
+      }
+      const data = await api('POST', '/api/onedrive/import', body);
+      appState.photos.push(...data.added);
+      if (data.page) {
+        const pageIdx = appState.pages.findIndex((p) => p.id === data.page.id);
+        if (pageIdx !== -1) appState.pages[pageIdx] = data.page;
+      }
+      renderLibraryTab();
+      renderEditorLibrary();
+      renderEditorCanvas();
+      flashSaved();
+      closeOneDriveModal();
+    } catch (err) {
+      setStatus('#oneDriveModalStatus', err.message, true);
+    }
+  }
+
+  function initOneDriveModal() {
+    $('#oneDriveModalClose').addEventListener('click', closeOneDriveModal);
+    $('#oneDriveModal').addEventListener('click', (e) => {
+      if (e.target === $('#oneDriveModal')) closeOneDriveModal();
+    });
+    $('#oneDriveImportBtn').addEventListener('click', importSelectedOneDrivePhotos);
+    $('#libraryOneDriveBtn').addEventListener('click', () => openOneDriveBrowser());
+    $('#pickerOneDriveBtn').addEventListener('click', () => {
+      if (!pickerTarget) return;
+      const { pageId, slotIndex } = pickerTarget;
+      closePicker();
+      openOneDriveBrowser(pageId, slotIndex);
+    });
+  }
+
   function openLightbox(photoId) {
     $('#lightboxImg').src = `/api/preview/${photoId}`;
     $('#lightbox').classList.add('active');
@@ -988,6 +1275,7 @@
     initEditorTab();
     initCropEditor();
     initExportTab();
+    initOneDriveModal();
 
     try {
       appState = await api('GET', '/api/state');
@@ -997,6 +1285,7 @@
     if (!appState.exports) appState.exports = [];
     if (!appState.pageSize) appState.pageSize = { widthIn: 11, heightIn: 8.5 };
     if (appState.layoutGap === undefined) appState.layoutGap = true;
+    if (!appState.oneDrive) appState.oneDrive = { clientId: null };
 
     $('#sourceFolderInput').value = appState.sourceFolder || '';
     $('#destFolderInput').value = defaultDestFolder();
@@ -1005,6 +1294,22 @@
     renderLibraryTab();
     renderEditorTab();
     renderExportTab();
+    renderOneDriveStatus();
+    handleOneDriveRedirect();
+  }
+
+  // After Microsoft redirects back from sign-in, the URL carries
+  // ?onedrive=connected (or =error&msg=...) -- show the result and strip
+  // those params so a page refresh doesn't re-trigger this message.
+  function handleOneDriveRedirect() {
+    const params = new URLSearchParams(window.location.search);
+    if (!params.has('onedrive')) return;
+    if (params.get('onedrive') === 'connected') {
+      setStatus('#oneDriveStatus', 'Connected!', false, true);
+    } else if (params.get('onedrive') === 'error') {
+      setStatus('#oneDriveStatus', params.get('msg') || 'OneDrive sign-in failed.', true);
+    }
+    window.history.replaceState({}, '', window.location.pathname);
   }
 
   document.addEventListener('DOMContentLoaded', init);

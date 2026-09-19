@@ -148,6 +148,60 @@ You don't need to repeat steps 1–3. Just:
 Your album (photos, pages, layout) is saved automatically as you work and
 will be there waiting for you next time.
 
+## Connecting OneDrive (optional)
+
+By default you add photos by pointing Setup at a folder already on this
+computer, or by using "Add from my computer" / dragging files in from File
+Explorer. If you'd rather browse and pick photos straight from OneDrive
+without downloading them all first, you can connect your Microsoft account.
+This is a one-time setup, takes about 5 minutes, and only you (using your
+own Microsoft account) can do it.
+
+**Why this step exists:** OneDrive's own website won't let you drag a photo
+out of it into another website — it only shares something Microsoft's other
+apps understand, not an actual file. To browse OneDrive from inside this
+app, the app needs to sign in with your Microsoft account through
+Microsoft's own login screen, which requires "registering" the app with
+Microsoft first (free, and doesn't require an Azure subscription).
+
+### One-time setup: register the app with Microsoft
+
+1. Go to **entra.microsoft.com** (or **portal.azure.com**) and sign in with
+   the Microsoft account whose OneDrive you want to use.
+2. Search for **"App registrations"** and click **+ New registration**.
+3. Name it anything, e.g. "Wedding Album Selector".
+4. Under **Supported account types**, choose *"Accounts in any
+   organizational directory and personal Microsoft accounts"*.
+5. Under **Redirect URI**, choose platform **"Mobile and desktop
+   applications"** and enter exactly:
+   ```
+   http://localhost:4173/auth/onedrive/callback
+   ```
+6. Click **Register**.
+7. On the app's Overview page, copy the **Application (client) ID** — a
+   string like `12345678-abcd-1234-abcd-1234567890ab`. You'll paste this
+   into the app in a moment.
+8. In the left sidebar, click **Authentication**, scroll down, turn on
+   **"Allow public client flows"**, and click **Save**.
+9. In the left sidebar, click **API permissions** → **+ Add a permission**
+   → **Microsoft Graph** → **Delegated permissions**, then search for and
+   check: `Files.Read`, `Files.Read.All`, `offline_access`, `User.Read`.
+   Click **Add permissions**.
+
+### Connect it in the app
+
+1. Open the app, go to the **Setup** tab.
+2. Paste the Application (client) ID into "Microsoft App Client ID" and
+   click **Save Client ID**.
+3. Click **Connect OneDrive** — you'll be sent to Microsoft's sign-in page
+   to log in and approve access, then sent back here.
+4. Once connected, an **"Add from OneDrive…"** button appears in the
+   Library tab and the photo picker — click it to browse your OneDrive
+   folders and add photos directly.
+
+This only needs to be done once per computer. Use the **Disconnect** button
+on the Setup tab if you ever want to sign out.
+
 ## If something goes wrong
 
 - **"npm not recognized" / "command not found"** — Node.js isn't installed

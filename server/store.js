@@ -13,7 +13,8 @@ const DEFAULT_STATE = {
   lastScan: null,
   exports: [],
   pageSize: { widthIn: 11, heightIn: 8.5 },
-  layoutGap: true
+  layoutGap: true,
+  oneDrive: { clientId: null }
 };
 
 function ensureDataDir() {

@@ -159,6 +159,37 @@ button.primary:hover, button.danger:hover { filter: brightness(0.95); }
   overflow: hidden; text-overflow: ellipsis;
 }
 
+/* OneDrive browser */
+.onedrive-breadcrumbs { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-bottom: 10px; font-size: 13px; }
+.onedrive-breadcrumbs button {
+  background: none; border: none; color: var(--accent); cursor: pointer;
+  font-size: 13px; padding: 2px 4px;
+}
+.onedrive-breadcrumbs button:disabled { color: var(--text); cursor: default; font-weight: 600; }
+.onedrive-breadcrumbs .crumb-sep { color: var(--text-muted); }
+
+.onedrive-tile { cursor: pointer; }
+.onedrive-tile.folder {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 6px; background: var(--panel-2, #eee); font-size: 28px;
+}
+.onedrive-tile.folder .folder-name {
+  font-size: 11px; padding: 0 4px; text-align: center;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; width: 100%;
+}
+.onedrive-tile.photo { border-color: transparent; }
+.onedrive-tile.photo.selected { border-color: var(--accent); }
+.onedrive-tile.photo .select-check {
+  position: absolute; top: 4px; left: 4px;
+  width: 22px; height: 22px; border-radius: 50%;
+  background: rgba(255,255,255,0.85); border: 2px solid #999;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px; color: transparent;
+}
+.onedrive-tile.photo.selected .select-check {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+}
+
 /* Editor */
 .editor-layout { display: flex; gap: 16px; align-items: flex-start; }
 .editor-library {

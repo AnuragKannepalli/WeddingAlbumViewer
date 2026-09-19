@@ -41,6 +41,19 @@
       <p id="clearLibraryStatus" class="status"></p>
     </div>
     <div class="panel-card">
+      <h2>OneDrive Integration</h2>
+      <p class="hint">One-time setup: register a free app with Microsoft so this app can sign in and browse your OneDrive photos directly (needed because OneDrive's own web page can't be dragged from). See GETTING_STARTED.md for the exact steps.</p>
+      <label>Microsoft App Client ID
+        <input type="text" id="oneDriveClientIdInput" placeholder="00000000-0000-0000-0000-000000000000" />
+      </label>
+      <div class="btn-row">
+        <button id="oneDriveSaveClientIdBtn">Save Client ID</button>
+        <button id="oneDriveConnectBtn" class="primary">Connect OneDrive</button>
+        <button id="oneDriveDisconnectBtn" class="danger" hidden>Disconnect</button>
+      </div>
+      <p id="oneDriveStatus" class="status"></p>
+    </div>
+    <div class="panel-card">
       <h2>Version History</h2>
       <p class="hint">A restore point is saved automatically before scanning a new folder, rescanning, or clearing the library — so any of those can be undone. Restoring one also saves your current state as a restore point first, so restoring is itself undoable.</p>
       <div id="historyList"></div>
@@ -52,6 +65,7 @@
     <div class="library-toolbar">
       <input type="text" id="librarySearch" placeholder="Search by filename..." />
       <label class="checkbox"><input type="checkbox" id="favOnlyToggle" /> Favorites only</label>
+      <button id="libraryOneDriveBtn">Add from OneDrive&hellip;</button>
       <span class="count-badge" id="libraryCount"></span>
     </div>
     <div class="photo-grid" id="libraryGrid"></div>
@@ -91,7 +105,7 @@
             <button id="pageMoveDown" title="Move page later">&#8595;</button>
           </div>
         </div>
-        <p class="hint">Drag the divider lines on the page below to resize how much space each photo gets.</p>
+        <p class="hint">Drag the divider lines on the page below to resize how much space each photo gets. You can drag a photo file straight from File Explorer onto any slot below.</p>
         <div class="editor-canvas-header">
           <label>Sheet size
             <select id="pageSizePreset">
@@ -160,6 +174,7 @@
     <div class="picker-toolbar">
       <input type="text" id="pickerSearch" placeholder="Search photos..." />
       <button id="pickerUploadBtn">Add from my computer&hellip;</button>
+      <button id="pickerOneDriveBtn">Add from OneDrive&hellip;</button>
       <input type="file" id="pickerUploadInput" accept="image/*" multiple hidden />
     </div>
     <p id="pickerUploadStatus" class="status"></p>
@@ -189,6 +204,23 @@
     <div class="modal-footer">
       <button id="cropCancelBtn">Cancel</button>
       <button id="cropDoneBtn" class="primary">Done</button>
+    </div>
+  </div>
+</div>
+
+<!-- OneDrive browser -->
+<div class="modal-backdrop" id="oneDriveModal">
+  <div class="modal">
+    <div class="modal-header">
+      <h3>Add from OneDrive</h3>
+      <button id="oneDriveModalClose" class="icon-btn">&times;</button>
+    </div>
+    <div class="onedrive-breadcrumbs" id="oneDriveBreadcrumbs"></div>
+    <p id="oneDriveModalStatus" class="status"></p>
+    <div class="photo-grid small" id="oneDriveGrid"></div>
+    <div class="modal-footer">
+      <span id="oneDriveSelectedCount" class="hint"></span>
+      <button id="oneDriveImportBtn" class="primary">Add Selected</button>
     </div>
   </div>
 </div>
