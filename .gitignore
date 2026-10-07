@@ -6,3 +6,9 @@ data/uploads/
 data/history/
 data/onedrive-cache.json
 *.log
+
+# Safety net: if a photographer export ever lands inside the project folder
+# (e.g. a relative path was typed into "Export location"), never let real
+# photos get swept into a commit.
+/Downloads/
+/Wedding-Album-Final_*/

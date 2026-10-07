@@ -1,5 +1,6 @@
 const fs = require('fs-extra');
 const path = require('path');
+const { LAYOUT_SLOT_COUNT } = require('./pages');
 
 function pad2(n) {
   return String(n).padStart(2, '0');
@@ -23,8 +24,10 @@ async function exportForPhotographer(state, destRoot) {
     const page = state.pages[pageIdx];
     const pageNum = pageIdx + 1;
     const filledSlots = page.slots.filter((s) => s && s.photoId);
-    if (filledSlots.length === 0) {
-      indexLines.push(`Page ${pageNum} (Layout: ${page.layout} photo${page.layout > 1 ? 's' : ''}) - EMPTY`);
+    const floats = page.floats || [];
+    const slotCount = LAYOUT_SLOT_COUNT[page.layout] || page.slots.length;
+    if (filledSlots.length === 0 && floats.length === 0) {
+      indexLines.push(`Page ${pageNum} (Layout: ${page.layout} - ${slotCount} photo${slotCount > 1 ? 's' : ''}) - EMPTY`);
       indexLines.push('');
       continue;
     }
@@ -32,7 +35,7 @@ async function exportForPhotographer(state, destRoot) {
     const pageFolder = path.join(destRoot, `Page-${pad2(pageNum)}`);
     await fs.ensureDir(pageFolder);
 
-    indexLines.push(`Page ${pageNum} (Layout: ${page.layout} photo${page.layout > 1 ? 's' : ''})`);
+    indexLines.push(`Page ${pageNum} (Layout: ${page.layout} - ${slotCount} photo${slotCount > 1 ? 's' : ''})`);
 
     let slotNum = 0;
     for (const slot of page.slots) {
@@ -51,6 +54,20 @@ async function exportForPhotographer(state, destRoot) {
       usedCount += 1;
       usedPhotoIds.add(photo.id);
     }
+
+    for (const float of floats) {
+      const photo = photosById.get(float.photoId);
+      if (!photo) continue;
+      slotNum += 1;
+      const destFilename = `${pad2(slotNum)}_FLOAT_${photo.filename}`;
+      const destPath = path.join(pageFolder, destFilename);
+      await fs.copyFile(photo.absPath, destPath);
+
+      indexLines.push(`  ${destFilename} (floating accent photo)`);
+      usedCount += 1;
+      usedPhotoIds.add(photo.id);
+    }
+
     indexLines.push('');
   }
 

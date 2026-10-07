@@ -70,4 +70,4 @@ async function getCroppedBuffer(absPath, crop, maxWidth) {
     .toBuffer();
 }
 
-module.exports = { getCachedImage, getResizedBuffer, getImageMeta, getCroppedBuffer };
+module.exports = { getCachedImage, getResizedBuffer, getImageMeta, getCroppedBuffer, getDisplayDimensions };

@@ -6,7 +6,7 @@ const multer = require('multer');
 
 const { loadState, saveState, snapshotState, listSnapshots, loadSnapshot, DATA_DIR } = require('./store');
 const { scanFolder, mergeScannedPhotos, photoIdForPath } = require('./scanner');
-const { getCachedImage } = require('./images');
+const { getCachedImage, getDisplayDimensions, getCroppedBuffer } = require('./images');
 const { makePage, resizeSlotsForLayout, nextPageId, defaultSplitsForLayout } = require('./pages');
 const { exportForPhotographer } = require('./exporter');
 const { exportPdf } = require('./pdfExporter');
@@ -27,29 +27,75 @@ process.on('unhandledRejection', (err) => {
 app.use(express.json({ limit: '5mb' }));
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
-let state = loadState();
-if (!state.exports) state.exports = [];
-if (!state.pageSize) state.pageSize = { widthIn: 11, heightIn: 8.5 };
-if (state.layoutGap === undefined) state.layoutGap = true;
-if (!state.oneDrive) state.oneDrive = { clientId: null };
-
-// Back-fill pages saved before adjustable splits existed.
-for (const page of state.pages) {
-  if (page.splits === undefined) page.splits = defaultSplitsForLayout(page.layout);
+function defaultProjectFields() {
+  return { pageSize: { widthIn: 11, heightIn: 8.5 }, layoutGap: true };
 }
 
-// Back-fill photo records saved before absPath/source existed on them, so
-// existing albums keep working (same ids, same slot assignments) after
-// upgrading to the version of this app that added "add from my computer".
-for (const photo of state.photos) {
-  if (!photo.source) photo.source = 'scan';
-  if (!photo.absPath && photo.source === 'scan' && state.sourceFolder && photo.relPath) {
-    photo.absPath = path.join(state.sourceFolder, photo.relPath);
+let appData = loadState();
+
+// Migrate pre-multi-project installs: the single shared
+// photos/pages/pageSize/etc. this app used to have becomes the first
+// project, so nothing about an existing album changes -- it just gets a
+// name and lives alongside any other projects created from here on. Each
+// project is otherwise exactly the shape state.json already had.
+if (!appData.projects) {
+  appData = {
+    oneDrive: appData.oneDrive || { clientId: null },
+    activeProjectId: 'project-1',
+    projects: [{
+      id: 'project-1',
+      name: 'Album 1',
+      sourceFolder: appData.sourceFolder || null,
+      photos: appData.photos || [],
+      pages: appData.pages || [],
+      lastScan: appData.lastScan || null,
+      exports: appData.exports || [],
+      pageSize: appData.pageSize || { widthIn: 11, heightIn: 8.5 },
+      layoutGap: appData.layoutGap === undefined ? true : appData.layoutGap
+    }]
+  };
+}
+if (!appData.oneDrive) appData.oneDrive = { clientId: null };
+if (!appData.activeProjectId || !appData.projects.some((p) => p.id === appData.activeProjectId)) {
+  appData.activeProjectId = appData.projects[0].id;
+}
+
+function activeProject() {
+  let project = appData.projects.find((p) => p.id === appData.activeProjectId);
+  if (!project) {
+    project = appData.projects[0];
+    appData.activeProjectId = project.id;
+  }
+  return project;
+}
+
+// Back-fill every project's own fields -- the same per-field backfills this
+// app has always done, just run once per project instead of once globally.
+for (const project of appData.projects) {
+  if (!project.exports) project.exports = [];
+  if (!project.pageSize) project.pageSize = defaultProjectFields().pageSize;
+  if (project.layoutGap === undefined) project.layoutGap = true;
+  if (project.sourceFolder === undefined) project.sourceFolder = null;
+  if (project.lastScan === undefined) project.lastScan = null;
+
+  for (const page of project.pages) {
+    if (page.splits === undefined) page.splits = defaultSplitsForLayout(page.layout);
+    if (!page.floats) page.floats = [];
+    for (const float of page.floats) {
+      if (float.crop === undefined) float.crop = null;
+    }
+  }
+
+  for (const photo of project.photos) {
+    if (!photo.source) photo.source = 'scan';
+    if (!photo.absPath && photo.source === 'scan' && project.sourceFolder && photo.relPath) {
+      photo.absPath = path.join(project.sourceFolder, photo.relPath);
+    }
   }
 }
 
 function persist() {
-  saveState(state);
+  saveState(appData);
 }
 persist();
 
@@ -82,17 +128,103 @@ const upload = multer({
   limits: { fileSize: 200 * 1024 * 1024 }
 });
 
-// ---- Setup / scanning ----
+// ---- Projects ----
+// Each project is a fully independent album: its own photo library and its
+// own pages, so you can build separate albums (e.g. "Ceremony" and
+// "Reception") without them sharing or mixing content. The OneDrive sign-in
+// is the one thing shared across all of them, since that's an account
+// connection, not album data.
 
 app.get('/api/state', (req, res) => {
-  res.json(state);
+  const project = activeProject();
+  res.json({
+    ...project,
+    oneDrive: appData.oneDrive,
+    activeProjectId: appData.activeProjectId,
+    projects: appData.projects.map((p) => ({
+      id: p.id,
+      name: p.name,
+      photoCount: p.photos.length,
+      pageCount: p.pages.length
+    }))
+  });
 });
 
+app.post('/api/projects', (req, res) => {
+  const name = (req.body.name || '').trim() || `Album ${appData.projects.length + 1}`;
+  const id = `project-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+  const project = {
+    id,
+    name,
+    sourceFolder: null,
+    photos: [],
+    pages: [],
+    lastScan: null,
+    exports: [],
+    ...defaultProjectFields()
+  };
+  appData.projects.push(project);
+  appData.activeProjectId = id;
+  persist();
+  res.json({ ok: true, projectId: id });
+});
+
+app.post('/api/projects/:id/activate', (req, res) => {
+  if (!appData.projects.some((p) => p.id === req.params.id)) {
+    return res.status(404).json({ ok: false, error: 'Project not found' });
+  }
+  appData.activeProjectId = req.params.id;
+  persist();
+  res.json({ ok: true });
+});
+
+app.put('/api/projects/:id', (req, res) => {
+  const project = appData.projects.find((p) => p.id === req.params.id);
+  if (!project) return res.status(404).json({ ok: false, error: 'Project not found' });
+  const name = (req.body.name || '').trim();
+  if (!name) return res.status(400).json({ ok: false, error: 'Name cannot be empty.' });
+  project.name = name;
+  persist();
+  res.json({ ok: true });
+});
+
+// Deletes an entire project (its photo library and pages), never the files
+// a "scanned" source folder points to (those were never copied) -- only
+// individually-added photos are physical copies this app made, and those
+// get cleaned up too. A restore point is saved first since this discards
+// a whole album at once. The last remaining project can't be deleted.
+app.delete('/api/projects/:id', async (req, res) => {
+  if (appData.projects.length <= 1) {
+    return res.status(400).json({ ok: false, error: 'Cannot delete the only remaining project.' });
+  }
+  const idx = appData.projects.findIndex((p) => p.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ ok: false, error: 'Project not found' });
+  snapshotState(appData);
+  const [removed] = appData.projects.splice(idx, 1);
+  if (appData.activeProjectId === req.params.id) {
+    appData.activeProjectId = appData.projects[0].id;
+  }
+  try {
+    for (const photo of removed.photos) {
+      if (photo.source === 'upload' && photo.absPath && photo.absPath.startsWith(uploadsDir)) {
+        await fs.remove(photo.absPath).catch(() => {});
+      }
+    }
+  } catch (err) {
+    console.error('Failed to clean up deleted project\'s uploaded files:', err.message);
+  }
+  persist();
+  res.json({ ok: true });
+});
+
+// ---- Setup / scanning ----
+
 app.post('/api/setup', (req, res) => {
+  const state = activeProject();
   const { sourceFolder } = req.body;
   try {
     const scanned = scanFolder(sourceFolder);
-    snapshotState(state);
+    snapshotState(appData);
     state.sourceFolder = sourceFolder;
     state.photos = mergeScannedPhotos(state.photos, scanned);
     state.lastScan = new Date().toISOString();
@@ -104,12 +236,13 @@ app.post('/api/setup', (req, res) => {
 });
 
 app.post('/api/rescan', (req, res) => {
+  const state = activeProject();
   if (!state.sourceFolder) {
     return res.status(400).json({ ok: false, error: 'No source folder set yet.' });
   }
   try {
     const scanned = scanFolder(state.sourceFolder);
-    snapshotState(state);
+    snapshotState(appData);
     const stillPresentIds = new Set([...scanned.map((p) => p.id), ...state.photos.filter((p) => p.source === 'upload').map((p) => p.id)]);
     state.photos = mergeScannedPhotos(state.photos, scanned);
     // Drop slot references to photos that no longer exist on disk.
@@ -135,6 +268,7 @@ app.post('/api/rescan', (req, res) => {
 // app's own data/uploads/ folder so it can be treated like any other photo
 // (thumbnailed, placed in a slot, exported) from then on.
 app.post('/api/upload', upload.array('photos', 50), (req, res) => {
+  const state = activeProject();
   if (!req.files || req.files.length === 0) {
     return res.status(400).json({ ok: false, error: 'No files received' });
   }
@@ -161,10 +295,10 @@ app.post('/api/upload', upload.array('photos', 50), (req, res) => {
   res.json({ ok: true, added, state });
 });
 
-// Saves already-downloaded image bytes as a new library photo (used by both
-// the drag-a-link import below and the OneDrive browser import), and, if a
-// slot was specified, places it there directly.
-async function addDownloadedPhoto(buffer, filename, pageId, slotIndex) {
+// Saves already-downloaded image bytes as a new library photo in the given
+// project (used by both the drag-a-link import below and the OneDrive
+// browser import), and, if a slot was specified, places it there directly.
+async function addDownloadedPhoto(state, buffer, filename, pageId, slotIndex) {
   const ext = path.extname(filename || '') || '.jpg';
   const unique = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
   const destPath = path.join(uploadsDir, `${unique}${ext}`);
@@ -209,6 +343,7 @@ async function addDownloadedPhoto(buffer, filename, pageId, slotIndex) {
 // (no cookies needed, which is also why it expires quickly -- if it fails,
 // dragging again from OneDrive gets a fresh one).
 app.post('/api/import-url', async (req, res) => {
+  const state = activeProject();
   const { url, filename, pageId, slotIndex } = req.body;
   if (!url || !/^https?:\/\//i.test(url)) {
     return res.status(400).json({ ok: false, error: 'A valid http(s) URL is required.' });
@@ -226,7 +361,7 @@ app.post('/api/import-url', async (req, res) => {
     }
     const buffer = Buffer.from(await response.arrayBuffer());
     const name = filename || `photo${CONTENT_TYPE_EXT[contentType] || '.jpg'}`;
-    const { record, page } = await addDownloadedPhoto(buffer, name, pageId, slotIndex);
+    const { record, page } = await addDownloadedPhoto(state, buffer, name, pageId, slotIndex);
     persist();
     res.json({ ok: true, photo: record, page });
   } catch (err) {
@@ -239,10 +374,12 @@ app.post('/api/import-url', async (req, res) => {
 // straight from OneDrive's web app, since dragging out of onedrive.com
 // directly doesn't work (its web UI only shares an internal item reference
 // on drag, not an actual file or URL -- see the comment above import-url).
+// The sign-in itself is shared across every project; which project an
+// imported photo lands in depends on whichever project is active.
 
 app.get('/api/onedrive/status', async (req, res) => {
   try {
-    const clientId = state.oneDrive.clientId;
+    const clientId = appData.oneDrive.clientId;
     if (!clientId) return res.json({ ok: true, configured: false, connected: false, account: null });
     const account = await onedrive.getAccount(clientId);
     res.json({ ok: true, configured: true, connected: !!account, account: account ? account.username : null });
@@ -252,14 +389,14 @@ app.get('/api/onedrive/status', async (req, res) => {
 });
 
 app.post('/api/onedrive/config', (req, res) => {
-  state.oneDrive.clientId = (req.body.clientId || '').trim() || null;
+  appData.oneDrive.clientId = (req.body.clientId || '').trim() || null;
   persist();
-  res.json({ ok: true, oneDrive: state.oneDrive });
+  res.json({ ok: true, oneDrive: appData.oneDrive });
 });
 
 app.post('/api/onedrive/logout', async (req, res) => {
   try {
-    await onedrive.signOut(state.oneDrive.clientId);
+    await onedrive.signOut(appData.oneDrive.clientId);
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -267,7 +404,7 @@ app.post('/api/onedrive/logout', async (req, res) => {
 });
 
 app.get('/auth/onedrive/login', async (req, res) => {
-  const clientId = state.oneDrive.clientId;
+  const clientId = appData.oneDrive.clientId;
   if (!clientId) return res.status(400).send('Set a OneDrive Client ID on the Setup tab first, then try connecting again.');
   try {
     const url = await onedrive.getAuthUrl(clientId, PORT);
@@ -289,7 +426,7 @@ app.get('/auth/onedrive/callback', async (req, res) => {
 
 app.get('/api/onedrive/browse', async (req, res) => {
   try {
-    const clientId = state.oneDrive.clientId;
+    const clientId = appData.oneDrive.clientId;
     const token = await onedrive.getAccessToken(clientId);
     const folderPath = req.query.id ? `/me/drive/items/${req.query.id}/children` : '/me/drive/root/children';
     const response = await onedrive.graphFetch(token, `${folderPath}?$top=200&$select=id,name,folder,file,image`);
@@ -306,7 +443,7 @@ app.get('/api/onedrive/browse', async (req, res) => {
 
 app.get('/api/onedrive/thumb/:itemId', async (req, res) => {
   try {
-    const clientId = state.oneDrive.clientId;
+    const clientId = appData.oneDrive.clientId;
     const token = await onedrive.getAccessToken(clientId);
     const response = await onedrive.graphFetch(token, `/me/drive/items/${req.params.itemId}/thumbnails/0/medium/content`);
     if (!response.ok) return res.status(404).end();
@@ -318,10 +455,12 @@ app.get('/api/onedrive/thumb/:itemId', async (req, res) => {
 });
 
 // Downloads the full-resolution original(s) for the given OneDrive item ids
-// and adds them to the library, same as any other imported photo.
+// and adds them to the active project's library, same as any other
+// imported photo.
 app.post('/api/onedrive/import', async (req, res) => {
+  const state = activeProject();
   try {
-    const clientId = state.oneDrive.clientId;
+    const clientId = appData.oneDrive.clientId;
     const { itemIds, pageId, slotIndex } = req.body;
     if (!Array.isArray(itemIds) || itemIds.length === 0) {
       return res.status(400).json({ ok: false, error: 'No photos selected.' });
@@ -339,7 +478,7 @@ app.post('/api/onedrive/import', async (req, res) => {
       if (!fileRes.ok) continue;
       const buffer = Buffer.from(await fileRes.arrayBuffer());
       const isFirst = added.length === 0;
-      const result = await addDownloadedPhoto(buffer, meta.name, isFirst ? pageId : undefined, isFirst ? slotIndex : undefined);
+      const result = await addDownloadedPhoto(state, buffer, meta.name, isFirst ? pageId : undefined, isFirst ? slotIndex : undefined);
       added.push(result.record);
       if (result.page) page = result.page;
     }
@@ -353,21 +492,26 @@ app.post('/api/onedrive/import', async (req, res) => {
   }
 });
 
-// Clears the app's photo catalog and album layout so a new source folder can
-// be scanned fresh. This never touches your original synced photos -- it
-// only forgets what the app has recorded in state.json. Photos individually
-// added via "Add from my computer" are physical copies this app made in
-// data/uploads/, so those files are removed too as part of starting over.
+// Clears the active project's photo catalog and album layout so a new
+// source folder can be scanned fresh. This never touches your original
+// synced photos -- it only forgets what the app has recorded in
+// state.json. Photos individually added via "Add from my computer" are
+// physical copies this app made in data/uploads/, so those files are
+// removed too as part of starting over. Other projects are untouched.
 app.post('/api/reset', async (req, res) => {
-  snapshotState(state);
+  const state = activeProject();
+  snapshotState(appData);
+  const uploadedPaths = state.photos.filter((p) => p.source === 'upload').map((p) => p.absPath);
   state.sourceFolder = null;
   state.photos = [];
   state.pages = [];
   state.lastScan = null;
   try {
-    await fs.emptyDir(uploadsDir);
+    for (const absPath of uploadedPaths) {
+      await fs.remove(absPath).catch(() => {});
+    }
   } catch (err) {
-    console.error('Failed to clear uploads dir:', err.message);
+    console.error('Failed to clear this project\'s uploaded files:', err.message);
   }
   persist();
   res.json({ ok: true, state });
@@ -375,8 +519,10 @@ app.post('/api/reset', async (req, res) => {
 
 // ---- Version history ----
 // A restore point is taken automatically before any action that replaces
-// or clears the photo catalog (switching source folders, rescanning,
-// clearing the library), so an unintended change is never unrecoverable.
+// or clears a project's photo catalog (switching source folders, rescanning,
+// clearing the library, deleting a page or a whole project), so an
+// unintended change is never unrecoverable. One history covers every
+// project at once, since restoring is a whole-app undo.
 
 app.get('/api/history', (req, res) => {
   try {
@@ -389,16 +535,45 @@ app.get('/api/history', (req, res) => {
 app.post('/api/history/:id/restore', (req, res) => {
   try {
     const snapshot = loadSnapshot(req.params.id);
-    snapshotState(state); // the current state becomes its own restore point first
-    state = snapshot;
-    if (!state.exports) state.exports = [];
-    if (state.layoutGap === undefined) state.layoutGap = true;
-    if (!state.oneDrive) state.oneDrive = { clientId: null };
-    for (const page of state.pages) {
-      if (page.splits === undefined) page.splits = defaultSplitsForLayout(page.layout);
+    snapshotState(appData); // the current state becomes its own restore point first
+    appData = snapshot;
+    if (!appData.oneDrive) appData.oneDrive = { clientId: null };
+    if (!appData.projects) {
+      // A snapshot taken before multi-project support existed: wrap it the
+      // same way the startup migration does.
+      appData = {
+        oneDrive: appData.oneDrive,
+        activeProjectId: 'project-1',
+        projects: [{
+          id: 'project-1',
+          name: 'Album 1',
+          sourceFolder: appData.sourceFolder || null,
+          photos: appData.photos || [],
+          pages: appData.pages || [],
+          lastScan: appData.lastScan || null,
+          exports: appData.exports || [],
+          pageSize: appData.pageSize || { widthIn: 11, heightIn: 8.5 },
+          layoutGap: appData.layoutGap === undefined ? true : appData.layoutGap
+        }]
+      };
+    }
+    if (!appData.activeProjectId || !appData.projects.some((p) => p.id === appData.activeProjectId)) {
+      appData.activeProjectId = appData.projects[0].id;
+    }
+    for (const project of appData.projects) {
+      if (!project.exports) project.exports = [];
+      if (project.layoutGap === undefined) project.layoutGap = true;
+      if (!project.pageSize) project.pageSize = { widthIn: 11, heightIn: 8.5 };
+      for (const page of project.pages) {
+        if (page.splits === undefined) page.splits = defaultSplitsForLayout(page.layout);
+        if (!page.floats) page.floats = [];
+        for (const float of page.floats) {
+          if (float.crop === undefined) float.crop = null;
+        }
+      }
     }
     persist();
-    res.json({ ok: true, state });
+    res.json({ ok: true, state: activeProject() });
   } catch (err) {
     res.status(400).json({ ok: false, error: err.message });
   }
@@ -407,6 +582,7 @@ app.post('/api/history/:id/restore', (req, res) => {
 // ---- Images ----
 
 app.get('/api/thumb/:id', async (req, res) => {
+  const state = activeProject();
   const photo = state.photos.find((p) => p.id === req.params.id);
   if (!photo) return res.status(404).end();
   try {
@@ -418,6 +594,7 @@ app.get('/api/thumb/:id', async (req, res) => {
 });
 
 app.get('/api/preview/:id', async (req, res) => {
+  const state = activeProject();
   const photo = state.photos.find((p) => p.id === req.params.id);
   if (!photo) return res.status(404).end();
   try {
@@ -428,9 +605,35 @@ app.get('/api/preview/:id', async (req, res) => {
   }
 });
 
+// Renders a free-shape crop (one whose rectangle doesn't necessarily match
+// its slot/float's own aspect ratio) as an actual cropped image, rather than
+// the CSS pan/zoom trick used for aspect-locked "fill slot" crops -- the
+// browser then just letterboxes this already-cropped image within its box.
+app.get('/api/crop-preview/:id', async (req, res) => {
+  const state = activeProject();
+  const photo = state.photos.find((p) => p.id === req.params.id);
+  if (!photo) return res.status(404).end();
+  const { x, y, w, h } = req.query;
+  if (x === undefined || y === undefined || w === undefined || h === undefined) {
+    return res.status(400).end();
+  }
+  try {
+    const buffer = await getCroppedBuffer(
+      photo.absPath,
+      { x: parseFloat(x), y: parseFloat(y), w: parseFloat(w), h: parseFloat(h) },
+      400
+    );
+    res.set('Content-Type', 'image/jpeg');
+    res.send(buffer);
+  } catch (err) {
+    res.status(500).end();
+  }
+});
+
 // ---- Favorites ----
 
 app.post('/api/favorite', (req, res) => {
+  const state = activeProject();
   const { id, favorite } = req.body;
   const photo = state.photos.find((p) => p.id === id);
   if (!photo) return res.status(404).json({ ok: false, error: 'Photo not found' });
@@ -439,9 +642,46 @@ app.post('/api/favorite', (req, res) => {
   res.json({ ok: true });
 });
 
-// ---- Page size (applies to every page in the album) ----
+// Removes one or more photos from this project's library entirely (not
+// just unassigning them), clearing any slot or floating-photo reference to
+// them across every page so nothing is left pointing at a photo that no
+// longer exists. A physical copy this app made (an upload/import) is
+// deleted from disk too; a photo that came from scanning a folder is only
+// forgotten from the catalog -- its real file is never touched. A restore
+// point is saved first since this can affect many pages at once.
+app.post('/api/photos/delete', async (req, res) => {
+  const state = activeProject();
+  const { ids } = req.body;
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ ok: false, error: 'No photo ids given.' });
+  }
+  snapshotState(appData);
+  const idSet = new Set(ids);
+  const toDelete = state.photos.filter((p) => idSet.has(p.id));
+  state.photos = state.photos.filter((p) => !idSet.has(p.id));
+  for (const page of state.pages) {
+    for (const slot of page.slots) {
+      if (slot.photoId && idSet.has(slot.photoId)) {
+        slot.photoId = null;
+        slot.hero = false;
+        slot.crop = null;
+      }
+    }
+    page.floats = page.floats.filter((f) => !idSet.has(f.photoId));
+  }
+  for (const photo of toDelete) {
+    if (photo.source === 'upload' && photo.absPath) {
+      await fs.remove(photo.absPath).catch(() => {});
+    }
+  }
+  persist();
+  res.json({ ok: true, photos: state.photos, pages: state.pages });
+});
+
+// ---- Page size (applies to every page in this project's album) ----
 
 app.post('/api/page-size', (req, res) => {
+  const state = activeProject();
   const widthIn = parseFloat(req.body.widthIn);
   const heightIn = parseFloat(req.body.heightIn);
   if (!(widthIn > 0) || !(heightIn > 0)) {
@@ -453,6 +693,7 @@ app.post('/api/page-size', (req, res) => {
 });
 
 app.post('/api/layout-gap', (req, res) => {
+  const state = activeProject();
   state.layoutGap = !!req.body.layoutGap;
   persist();
   res.json({ ok: true, layoutGap: state.layoutGap });
@@ -461,6 +702,7 @@ app.post('/api/layout-gap', (req, res) => {
 // ---- Pages ----
 
 app.post('/api/pages/count', (req, res) => {
+  const state = activeProject();
   const { count } = req.body;
   const target = Math.max(0, parseInt(count, 10) || 0);
   if (target > state.pages.length) {
@@ -475,6 +717,7 @@ app.post('/api/pages/count', (req, res) => {
 });
 
 app.put('/api/pages/:pageId/layout', (req, res) => {
+  const state = activeProject();
   const { layout } = req.body;
   const page = state.pages.find((p) => p.id === req.params.pageId);
   if (!page) return res.status(404).json({ ok: false, error: 'Page not found' });
@@ -486,6 +729,7 @@ app.put('/api/pages/:pageId/layout', (req, res) => {
 });
 
 app.put('/api/pages/:pageId/splits', (req, res) => {
+  const state = activeProject();
   const page = state.pages.find((p) => p.id === req.params.pageId);
   if (!page) return res.status(404).json({ ok: false, error: 'Page not found' });
   const { primary, secondary } = req.body;
@@ -501,7 +745,91 @@ app.put('/api/pages/:pageId/splits', (req, res) => {
   res.json({ ok: true, page });
 });
 
+// ---- Floating accent photos ----
+// Independent of a page's slot grid: small photos that can be freely
+// positioned and resized anywhere on the page (even overlapping the main
+// slot photo), for a scrapbook/collage look. x/y/w/h are fractions (0-1) of
+// the whole printed sheet, not just the margin area the slot grid uses.
+
+const FLOAT_DEFAULT_WIDTH_FRACTION = 0.22;
+const FLOAT_START_POSITIONS = [
+  { x: 0.62, y: 0.08 },
+  { x: 0.08, y: 0.62 },
+  { x: 0.62, y: 0.62 },
+  { x: 0.08, y: 0.08 }
+];
+
+app.post('/api/pages/:pageId/floats', async (req, res) => {
+  const state = activeProject();
+  const page = state.pages.find((p) => p.id === req.params.pageId);
+  if (!page) return res.status(404).json({ ok: false, error: 'Page not found' });
+  const photo = state.photos.find((p) => p.id === req.body.photoId);
+  if (!photo) return res.status(404).json({ ok: false, error: 'Photo not found' });
+  try {
+    const { width, height } = await getDisplayDimensions(photo.absPath);
+    const pageAspect = state.pageSize.widthIn / state.pageSize.heightIn;
+    const w = FLOAT_DEFAULT_WIDTH_FRACTION;
+    const h = Math.min(0.9, w * pageAspect * (height / width));
+    const pos = FLOAT_START_POSITIONS[page.floats.length % FLOAT_START_POSITIONS.length];
+    const float = {
+      id: `float-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+      photoId: photo.id,
+      x: pos.x,
+      y: pos.y,
+      w,
+      h,
+      crop: null
+    };
+    page.floats.push(float);
+    persist();
+    res.json({ ok: true, page });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err.message });
+  }
+});
+
+app.put('/api/pages/:pageId/floats/:floatId', (req, res) => {
+  const state = activeProject();
+  const page = state.pages.find((p) => p.id === req.params.pageId);
+  if (!page) return res.status(404).json({ ok: false, error: 'Page not found' });
+  const float = page.floats.find((f) => f.id === req.params.floatId);
+  if (!float) return res.status(404).json({ ok: false, error: 'Floating photo not found' });
+  const clampSize = (v) => Math.min(1, Math.max(0.03, v));
+  const { x, y, w, h, crop, photoId } = req.body;
+  // Replacing which photo a float shows (e.g. by dropping a new one onto
+  // it) keeps its position/size exactly where they were -- only the
+  // content changes -- and clears any crop, which was framed for the old
+  // photo and likely wouldn't make sense on the new one.
+  if (photoId !== undefined) {
+    const photo = state.photos.find((p) => p.id === photoId);
+    if (!photo) return res.status(404).json({ ok: false, error: 'Photo not found' });
+    float.photoId = photoId;
+    float.crop = null;
+  }
+  // A float may hang partway off the page edge (a common scrapbook look),
+  // so position is clamped relative to its own half-width/height, not to
+  // [0,1] outright -- and must use whichever size (new or existing) is
+  // current once both x/y and w/h are applied below.
+  if (w !== undefined) float.w = clampSize(parseFloat(w));
+  if (h !== undefined) float.h = clampSize(parseFloat(h));
+  if (x !== undefined) float.x = Math.min(1 - float.w / 2, Math.max(-float.w / 2, parseFloat(x)));
+  if (y !== undefined) float.y = Math.min(1 - float.h / 2, Math.max(-float.h / 2, parseFloat(y)));
+  if (crop !== undefined) float.crop = crop;
+  persist();
+  res.json({ ok: true, page });
+});
+
+app.delete('/api/pages/:pageId/floats/:floatId', (req, res) => {
+  const state = activeProject();
+  const page = state.pages.find((p) => p.id === req.params.pageId);
+  if (!page) return res.status(404).json({ ok: false, error: 'Page not found' });
+  page.floats = page.floats.filter((f) => f.id !== req.params.floatId);
+  persist();
+  res.json({ ok: true, page });
+});
+
 app.put('/api/pages/:pageId/slot/:slotIndex', (req, res) => {
+  const state = activeProject();
   const page = state.pages.find((p) => p.id === req.params.pageId);
   if (!page) return res.status(404).json({ ok: false, error: 'Page not found' });
   const idx = parseInt(req.params.slotIndex, 10);
@@ -523,7 +851,27 @@ app.put('/api/pages/:pageId/slot/:slotIndex', (req, res) => {
   res.json({ ok: true, page });
 });
 
+// Rearranges two slots on the same page by swapping their entire contents
+// (photo, hero flag, crop) -- used when dragging a filled slot onto
+// another slot to reposition it, instead of overwriting the target.
+app.post('/api/pages/:pageId/slots/swap', (req, res) => {
+  const state = activeProject();
+  const page = state.pages.find((p) => p.id === req.params.pageId);
+  if (!page) return res.status(404).json({ ok: false, error: 'Page not found' });
+  const idxA = parseInt(req.body.a, 10);
+  const idxB = parseInt(req.body.b, 10);
+  if (idxA < 0 || idxA >= page.slots.length || idxB < 0 || idxB >= page.slots.length) {
+    return res.status(400).json({ ok: false, error: 'Invalid slot index' });
+  }
+  const tmp = page.slots[idxA];
+  page.slots[idxA] = page.slots[idxB];
+  page.slots[idxB] = tmp;
+  persist();
+  res.json({ ok: true, page });
+});
+
 app.post('/api/pages/move', (req, res) => {
+  const state = activeProject();
   const { pageId, direction } = req.body;
   const idx = state.pages.findIndex((p) => p.id === pageId);
   if (idx === -1) return res.status(404).json({ ok: false, error: 'Page not found' });
@@ -539,6 +887,7 @@ app.post('/api/pages/move', (req, res) => {
 // Reorders pages to an arbitrary new order (used by drag-to-reorder in the
 // page rail). `order` must list every existing page id exactly once.
 app.post('/api/pages/reorder', (req, res) => {
+  const state = activeProject();
   const { order } = req.body;
   if (!Array.isArray(order)) {
     return res.status(400).json({ ok: false, error: 'order must be an array of page ids.' });
@@ -553,13 +902,37 @@ app.post('/api/pages/reorder', (req, res) => {
   res.json({ ok: true, pages: state.pages });
 });
 
+// Deletes one page entirely (its slot photos and any floating photos on it
+// are gone, but the underlying photos stay in the library). A restore
+// point is saved first since this discards a whole page's layout at once.
+app.delete('/api/pages/:pageId', (req, res) => {
+  const state = activeProject();
+  const idx = state.pages.findIndex((p) => p.id === req.params.pageId);
+  if (idx === -1) return res.status(404).json({ ok: false, error: 'Page not found' });
+  snapshotState(appData);
+  state.pages.splice(idx, 1);
+  persist();
+  res.json({ ok: true, pages: state.pages });
+});
+
 // ---- Export ----
 
 app.post('/api/export/photographer', async (req, res) => {
+  const state = activeProject();
   const { baseFolder } = req.body;
   const base = baseFolder || state.sourceFolder;
   if (!base) {
     return res.status(400).json({ ok: false, error: 'No export location set. Enter a folder path first.' });
+  }
+  // A relative path (e.g. "Downloads" instead of "C:\Users\you\Downloads")
+  // would resolve against this server process's own working directory --
+  // the app's install folder -- landing real photos inside the project
+  // instead of wherever the user meant. Require a full path instead.
+  if (!path.isAbsolute(base)) {
+    return res.status(400).json({
+      ok: false,
+      error: `"${base}" isn't a full path. Enter the complete folder path (e.g. C:\\Users\\yourname\\Downloads), not just a folder name.`
+    });
   }
   try {
     const target = path.join(base, timestampFolderName());
@@ -581,6 +954,7 @@ app.post('/api/export/photographer', async (req, res) => {
 });
 
 app.delete('/api/exports/:id', async (req, res) => {
+  const state = activeProject();
   const record = state.exports.find((e) => e.id === req.params.id);
   if (!record) return res.status(404).json({ ok: false, error: 'Export not found' });
   try {
@@ -594,6 +968,7 @@ app.delete('/api/exports/:id', async (req, res) => {
 });
 
 app.post('/api/export/pdf', async (req, res) => {
+  const state = activeProject();
   const destPath = path.join(DATA_DIR, 'exports', 'wedding-album.pdf');
   try {
     await exportPdf(state, destPath);

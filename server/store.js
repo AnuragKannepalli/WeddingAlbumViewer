@@ -6,14 +6,14 @@ const STATE_FILE = path.join(DATA_DIR, 'state.json');
 const HISTORY_DIR = path.join(DATA_DIR, 'history');
 const MAX_SNAPSHOTS = 20;
 
+// Deliberately does NOT include `projects`/`activeProjectId` here: this
+// gets shallow-merged over whatever's actually on disk in loadState() and
+// loadSnapshot() below, and if it included a default (even an empty)
+// `projects` array, that would mask the absence of one on an old,
+// pre-multi-project state.json or snapshot -- silently defeating
+// server/index.js's own migration check (`if (!appData.projects)`) and
+// orphaning all of that real data instead of wrapping it into "Album 1".
 const DEFAULT_STATE = {
-  sourceFolder: null,
-  photos: [],
-  pages: [],
-  lastScan: null,
-  exports: [],
-  pageSize: { widthIn: 11, heightIn: 8.5 },
-  layoutGap: true,
   oneDrive: { clientId: null }
 };
 
@@ -75,12 +75,15 @@ function listSnapshots() {
   return files.map((filename) => {
     const raw = fs.readFileSync(path.join(HISTORY_DIR, filename), 'utf-8');
     const parsed = JSON.parse(raw);
+    // A snapshot taken before multi-project support existed is just one
+    // flat project; summarize it the same way as a real `projects` array.
+    const projects = parsed.projects || [{ photos: parsed.photos, pages: parsed.pages }];
     return {
       id: filename,
       createdAt: new Date(parseInt(filename, 10)).toISOString(),
-      sourceFolder: parsed.sourceFolder || null,
-      photoCount: (parsed.photos || []).length,
-      pageCount: (parsed.pages || []).length
+      projectCount: projects.length,
+      photoCount: projects.reduce((sum, p) => sum + (p.photos || []).length, 0),
+      pageCount: projects.reduce((sum, p) => sum + (p.pages || []).length, 0)
     };
   });
 }
