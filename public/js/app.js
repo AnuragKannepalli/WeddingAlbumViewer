@@ -7,6 +7,22 @@
   let slotFileTarget = null; // { pageId, slotIndex }
   let slotDragSource = null; // { pageId, slotIndex } -- set while dragging a filled slot to rearrange it
 
+  // Named sheet-size shortcuts shown in the preset dropdown. Keys must
+  // match the <option value="..."> in index.html; anything not matching
+  // one of these (or not matching its exact width/height) falls back to
+  // "Custom size...".
+  const PAGE_SIZE_PRESETS = {
+    landscape: { widthIn: 11, heightIn: 8.5 },
+    portrait: { widthIn: 8.5, heightIn: 11 },
+    '14x11': { widthIn: 14, heightIn: 11 },
+    '11x14': { widthIn: 11, heightIn: 14 },
+    '12x12': { widthIn: 12, heightIn: 12 },
+    '10x10': { widthIn: 10, heightIn: 10 },
+    '8x8': { widthIn: 8, heightIn: 8 },
+    'a4-landscape': { widthIn: 11.7, heightIn: 8.3 },
+    'a4-portrait': { widthIn: 8.3, heightIn: 11.7 }
+  };
+
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
@@ -441,9 +457,10 @@
     wirePageStageFloatDrop();
 
     $('#pageSizePreset').addEventListener('change', async (e) => {
-      if (e.target.value === 'landscape') {
+      const preset = PAGE_SIZE_PRESETS[e.target.value];
+      if (preset) {
         $('#pageSizeCustomInputs').hidden = true;
-        await applyPageSize(11, 8.5);
+        await applyPageSize(preset.widthIn, preset.heightIn);
       } else {
         $('#pageSizeCustomInputs').hidden = false;
         $('#pageSizeWidth').value = appState.pageSize.widthIn;
@@ -567,9 +584,11 @@
 
   function syncPageSizeControls() {
     const { widthIn, heightIn } = appState.pageSize || { widthIn: 11, heightIn: 8.5 };
-    const isDefaultLandscape = widthIn === 11 && heightIn === 8.5;
-    $('#pageSizePreset').value = isDefaultLandscape ? 'landscape' : 'custom';
-    $('#pageSizeCustomInputs').hidden = isDefaultLandscape;
+    const matchedPreset = Object.keys(PAGE_SIZE_PRESETS).find(
+      (key) => PAGE_SIZE_PRESETS[key].widthIn === widthIn && PAGE_SIZE_PRESETS[key].heightIn === heightIn
+    );
+    $('#pageSizePreset').value = matchedPreset || 'custom';
+    $('#pageSizeCustomInputs').hidden = !!matchedPreset;
     $('#pageSizeWidth').value = widthIn;
     $('#pageSizeHeight').value = heightIn;
   }
