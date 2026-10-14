@@ -2302,6 +2302,7 @@
     $('#appHeader').hidden = true;
     $('#appMain').hidden = true;
     $('#projectChooser').hidden = false;
+    document.title = 'Wedding Album Selector';
     renderProjectChooser();
   }
 
@@ -2309,6 +2310,11 @@
     $('#projectChooser').hidden = true;
     $('#appHeader').hidden = false;
     $('#appMain').hidden = false;
+    const activeProject = appState.projects.find((p) => p.id === appState.activeProjectId);
+    const albumName = activeProject ? activeProject.name : '';
+    $('#currentAlbumName').textContent = albumName;
+    $('#currentAlbumName').title = albumName;
+    document.title = albumName ? `${albumName} - Wedding Album Selector` : 'Wedding Album Selector';
     currentPageIndex = 0;
     $('#sourceFolderInput').value = appState.sourceFolder || '';
     $('#destFolderInput').value = defaultDestFolder();

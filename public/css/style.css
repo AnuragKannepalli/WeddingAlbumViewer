@@ -53,6 +53,17 @@ body {
   z-index: 20;
 }
 .topbar h1 { font-size: 18px; margin: 0; white-space: nowrap; }
+.current-album-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--accent-dark);
+  padding-left: 16px;
+  border-left: 1px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 260px;
+}
 
 .tabs { display: flex; gap: 6px; flex: 1; }
 .tab-btn {
