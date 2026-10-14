@@ -4,6 +4,7 @@ data/cache/
 data/exports/
 data/uploads/
 data/history/
+data/tmp/
 data/onedrive-cache.json
 *.log
 

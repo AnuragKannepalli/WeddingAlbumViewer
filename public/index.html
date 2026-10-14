@@ -13,7 +13,12 @@
   <h1>Your Albums</h1>
   <p class="hint">Each album has its own fully separate photo library and pages. Pick one to open it, or start a new one.</p>
   <div class="project-grid" id="projectGrid"></div>
-  <button id="newProjectBtn" class="primary">+ New Album</button>
+  <div class="btn-row">
+    <button id="newProjectBtn" class="primary">+ New Album</button>
+    <button id="importProjectBtn">Import Album&hellip;</button>
+    <input type="file" id="importProjectInput" accept=".zip" hidden />
+  </div>
+  <p id="importProjectStatus" class="status"></p>
 </section>
 
 <header class="topbar" id="appHeader" hidden>

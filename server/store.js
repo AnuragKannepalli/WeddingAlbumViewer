@@ -22,6 +22,7 @@ function ensureDataDir() {
   fs.ensureDirSync(path.join(DATA_DIR, 'cache'));
   fs.ensureDirSync(path.join(DATA_DIR, 'exports'));
   fs.ensureDirSync(path.join(DATA_DIR, 'uploads'));
+  fs.ensureDirSync(path.join(DATA_DIR, 'tmp'));
   fs.ensureDirSync(HISTORY_DIR);
 }
 

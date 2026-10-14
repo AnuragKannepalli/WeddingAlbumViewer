@@ -2340,6 +2340,7 @@
         <div class="project-meta">${p.photoCount} photo${p.photoCount === 1 ? '' : 's'} &middot; ${p.pageCount} page${p.pageCount === 1 ? '' : 's'}</div>
         <div class="project-card-actions">
           <button class="project-rename-btn" data-project-id="${p.id}">Rename</button>
+          <button class="project-export-btn" data-project-id="${p.id}">Export to Edit&hellip;</button>
           ${appState.projects.length > 1 ? `<button class="project-delete-btn danger" data-project-id="${p.id}">Delete</button>` : ''}
         </div>
       </div>
@@ -2349,6 +2350,14 @@
       card.addEventListener('click', (e) => {
         if (e.target.closest('button')) return;
         openProject(card.dataset.projectId);
+      });
+    });
+    grid.querySelectorAll('.project-export-btn').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        // A plain navigation (not fetch) so the browser handles it as a
+        // normal file download, same as the PDF export already does.
+        window.location = `/api/projects/${btn.dataset.projectId}/export`;
       });
     });
     grid.querySelectorAll('.project-rename-btn').forEach((btn) => {
@@ -2404,6 +2413,25 @@
 
     $('#switchProjectBtn').addEventListener('click', showProjectChooser);
     $('#quickUndoBtn').addEventListener('click', quickUndo);
+
+    $('#importProjectBtn').addEventListener('click', () => $('#importProjectInput').click());
+    $('#importProjectInput').addEventListener('change', async (e) => {
+      const file = e.target.files && e.target.files[0];
+      e.target.value = '';
+      if (!file) return;
+      setStatus('#importProjectStatus', 'Importing album... this can take a moment for a large one.', false);
+      const formData = new FormData();
+      formData.append('albumZip', file);
+      try {
+        const data = await api('POST', '/api/projects/import', formData);
+        appState = await api('GET', '/api/state');
+        normalizeAppState();
+        setStatus('#importProjectStatus', `Imported ${data.photoCount} photo(s) across ${data.pageCount} page(s).`, false, true);
+        renderProjectChooser();
+      } catch (err) {
+        setStatus('#importProjectStatus', err.message, true);
+      }
+    });
   }
 
   // A one-click shortcut to the most recent automatic restore point (the

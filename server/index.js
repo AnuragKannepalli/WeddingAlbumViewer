@@ -3,6 +3,8 @@ const path = require('path');
 const fs = require('fs-extra');
 const crypto = require('crypto');
 const multer = require('multer');
+const archiver = require('archiver');
+const unzipper = require('unzipper');
 
 const { loadState, saveState, snapshotState, listSnapshots, loadSnapshot, DATA_DIR } = require('./store');
 const { scanFolder, mergeScannedPhotos, photoIdForPath } = require('./scanner');
@@ -99,10 +101,20 @@ function persist() {
 }
 persist();
 
-function timestampFolderName() {
+function timestampSuffix() {
   const d = new Date();
   const pad = (n) => String(n).padStart(2, '0');
-  return `Wedding-Album-Final_${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;
+}
+
+// Every project already gets a real name at creation (falling back to
+// "Album N" there if none was typed -- see POST /api/projects below), so
+// this is just making that name safe to put in a filename, with "Album"
+// as a last-resort fallback for the pathological case of a name that's
+// nothing but characters this strips out.
+function safeFileName(name) {
+  const cleaned = (name || '').replace(/[^a-z0-9 _-]/gi, '').trim();
+  return cleaned || 'Album';
 }
 
 const CONTENT_TYPE_EXT = {
@@ -126,6 +138,18 @@ const upload = multer({
     }
   }),
   limits: { fileSize: 200 * 1024 * 1024 }
+});
+
+// For importing an exported album .zip (see /api/projects/import below) --
+// stored to a temp file first since zips can be large and need to be read
+// back (not just streamed through once) to pull out album.json and every
+// photo inside.
+const importUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, path.join(DATA_DIR, 'tmp')),
+    filename: (req, file, cb) => cb(null, `import-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.zip`)
+  }),
+  limits: { fileSize: 2 * 1024 * 1024 * 1024 }
 });
 
 // ---- Projects ----
@@ -215,6 +239,139 @@ app.delete('/api/projects/:id', async (req, res) => {
   }
   persist();
   res.json({ ok: true });
+});
+
+// Bundles one album (its pages plus every photo it actually uses) into a
+// single .zip that someone else can hand to their own copy of this app and
+// import as a brand-new, fully independent album -- see
+// POST /api/projects/import below. Nothing else (other albums, OneDrive
+// sign-in) is included.
+app.get('/api/projects/:id/export', async (req, res) => {
+  const project = appData.projects.find((p) => p.id === req.params.id);
+  if (!project) return res.status(404).json({ ok: false, error: 'Project not found' });
+
+  res.attachment(`${safeFileName(project.name)}_Edit.zip`);
+
+  // Store rather than deflate: nearly everything in here is already a
+  // compressed JPEG (or similar), so spending CPU time trying to compress
+  // it further saves almost no space but makes a several-hundred-photo
+  // export take many times longer than it needs to.
+  const archive = archiver('zip', { store: true });
+  archive.on('error', (err) => {
+    console.error('Album export failed:', err.message);
+    res.end();
+  });
+  archive.pipe(res);
+
+  const exportedPhotos = [];
+  for (const photo of project.photos) {
+    // Skip anything missing on disk rather than failing the whole export --
+    // a stale reference shouldn't block handing off everything else.
+    if (!photo.absPath || !(await fs.pathExists(photo.absPath))) continue;
+    const ext = path.extname(photo.absPath) || path.extname(photo.filename) || '.jpg';
+    const zipPath = `photos/${photo.id}${ext}`;
+    archive.file(photo.absPath, { name: zipPath });
+    exportedPhotos.push({
+      id: photo.id,
+      zipPath,
+      filename: photo.filename,
+      size: photo.size,
+      mtimeMs: photo.mtimeMs,
+      burstGroup: photo.burstGroup,
+      possibleDuplicate: photo.possibleDuplicate,
+      favorite: photo.favorite
+    });
+  }
+
+  const bundle = {
+    formatVersion: 1,
+    name: project.name,
+    pages: project.pages,
+    pageSize: project.pageSize,
+    layoutGap: project.layoutGap,
+    photos: exportedPhotos
+  };
+  archive.append(JSON.stringify(bundle, null, 2), { name: 'album.json' });
+  await archive.finalize();
+});
+
+// Imports an album .zip made by the export route above as a brand-new
+// project here -- its own copies of every photo and its own pages,
+// completely separate from any album already in this app.
+app.post('/api/projects/import', importUpload.single('albumZip'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: 'No file received.' });
+  try {
+    const directory = await unzipper.Open.file(req.file.path);
+    const albumEntry = directory.files.find((f) => f.path === 'album.json');
+    if (!albumEntry) {
+      throw new Error("This doesn't look like an exported album (missing album.json).");
+    }
+    const albumJson = JSON.parse((await albumEntry.buffer()).toString('utf-8'));
+
+    await fs.ensureDir(uploadsDir);
+    const idMap = new Map(); // the sender's photo id -> this app's new id for it
+    const newPhotos = [];
+    for (const photo of albumJson.photos || []) {
+      const entry = directory.files.find((f) => f.path === photo.zipPath);
+      if (!entry) continue; // the export itself was already missing this one
+      const ext = path.extname(photo.zipPath || '') || '.jpg';
+      const unique = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
+      const destPath = path.join(uploadsDir, `${unique}${ext}`);
+      const buffer = await entry.buffer();
+      await fs.writeFile(destPath, buffer);
+      const newId = photoIdForPath(destPath);
+      idMap.set(photo.id, newId);
+      newPhotos.push({
+        id: newId,
+        absPath: destPath,
+        relPath: null,
+        filename: photo.filename || path.basename(destPath),
+        size: photo.size || buffer.length,
+        mtimeMs: photo.mtimeMs || Date.now(),
+        burstGroup: photo.burstGroup || null,
+        possibleDuplicate: !!photo.possibleDuplicate,
+        favorite: !!photo.favorite,
+        source: 'upload'
+      });
+    }
+
+    // Every page/slot/float referenced the sender's own photo ids -- remap
+    // them to the new ones just assigned above, and drop anything that
+    // pointed at a photo this import couldn't bring across.
+    const newPages = (albumJson.pages || []).map((page) => ({
+      ...page,
+      slots: (page.slots || []).map((slot) => {
+        if (!slot || !slot.photoId) return slot;
+        const mappedId = idMap.get(slot.photoId);
+        return mappedId ? { ...slot, photoId: mappedId } : { photoId: null, hero: false, crop: null };
+      }),
+      floats: (page.floats || [])
+        .filter((f) => idMap.has(f.photoId))
+        .map((f) => ({ ...f, photoId: idMap.get(f.photoId) })),
+      splits: page.splits === undefined ? defaultSplitsForLayout(page.layout) : page.splits
+    }));
+
+    const newProjectId = `project-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+    const newProject = {
+      id: newProjectId,
+      name: albumJson.name ? `${albumJson.name} (Imported)` : 'Imported Album',
+      sourceFolder: null,
+      photos: newPhotos,
+      pages: newPages,
+      lastScan: null,
+      exports: [],
+      pageSize: albumJson.pageSize || { widthIn: 11, heightIn: 8.5 },
+      layoutGap: albumJson.layoutGap === undefined ? true : albumJson.layoutGap
+    };
+    appData.projects.push(newProject);
+    appData.activeProjectId = newProjectId;
+    persist();
+    res.json({ ok: true, projectId: newProjectId, photoCount: newPhotos.length, pageCount: newPages.length });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err.message });
+  } finally {
+    await fs.remove(req.file.path).catch(() => {});
+  }
 });
 
 // ---- Setup / scanning ----
@@ -935,7 +1092,7 @@ app.post('/api/export/photographer', async (req, res) => {
     });
   }
   try {
-    const target = path.join(base, timestampFolderName());
+    const target = path.join(base, `${safeFileName(state.name)}_Photographer_${timestampSuffix()}`);
     const summary = await exportForPhotographer(state, target);
     const record = {
       id: crypto.randomUUID(),
@@ -979,9 +1136,10 @@ app.post('/api/export/pdf', async (req, res) => {
 });
 
 app.get('/api/export/pdf/download', (req, res) => {
+  const state = activeProject();
   const destPath = path.join(DATA_DIR, 'exports', 'wedding-album.pdf');
   if (!fs.existsSync(destPath)) return res.status(404).end();
-  res.download(destPath, 'Wedding-Album.pdf');
+  res.download(destPath, `${safeFileName(state.name)}_PDF.pdf`);
 });
 
 app.listen(PORT, () => {
