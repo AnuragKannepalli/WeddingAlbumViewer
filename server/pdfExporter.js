@@ -152,9 +152,87 @@ function layoutRects(layout, x, y, w, h, gap, splits) {
   }
 }
 
-async function drawImageInRect(doc, buffer, rect) {
+// Builds a clip path on `doc` matching one of the selectable photo shapes,
+// sized to `rect` -- the PDF-side counterpart of the CSS clip-path/
+// border-radius rules in style.css. Caller must doc.save() before and
+// doc.restore() after (it only sets up the path and clips, doesn't bracket).
+function clipShape(doc, shape, rect) {
+  if (!shape || shape === 'none') return false;
+  const { x, y, w, h } = rect;
+  switch (shape) {
+    case 'circle': {
+      const r = Math.min(w, h) / 2;
+      doc.circle(x + w / 2, y + h / 2, r);
+      break;
+    }
+    case 'oval': {
+      doc.ellipse(x + w / 2, y + h / 2, w / 2, h / 2);
+      break;
+    }
+    case 'rounded': {
+      const r = Math.min(w, h) * 0.12;
+      doc.roundedRect(x, y, w, h, r);
+      break;
+    }
+    case 'diamond': {
+      doc
+        .moveTo(x + w / 2, y)
+        .lineTo(x + w, y + h / 2)
+        .lineTo(x + w / 2, y + h)
+        .lineTo(x, y + h / 2)
+        .closePath();
+      break;
+    }
+    case 'heart': {
+      const cx = x + w / 2;
+      const topY = y + h * 0.3;
+      doc
+        .moveTo(cx, y + h)
+        .bezierCurveTo(x - w * 0.1, y + h * 0.55, x + w * 0.05, y, cx, topY)
+        .bezierCurveTo(x + w * 0.95, y, x + w * 1.1, y + h * 0.55, cx, y + h)
+        .closePath();
+      break;
+    }
+    default:
+      return false;
+  }
+  doc.clip();
+  return true;
+}
+
+// Draws `buffer` so its final (post-rotation) visual footprint is exactly
+// (drawX, drawY, drawW, drawH), optionally also mirrored left-right.
+// Rotation is a coordinate-system rotation around that footprint's own
+// center (doc.rotate), not a re-encode of the image data, so for a 90/270
+// rotation the image must then be drawn at its PRE-rotation dimensions
+// (width/height swapped back) for the rotated result to land on the
+// intended footprint -- same idea as rotating a photo print on a table:
+// the paper's own width/height don't change, only its orientation.
+function drawImageTransformed(doc, buffer, drawX, drawY, drawW, drawH, mirrored, rotation) {
+  const rotated = rotation === 90 || rotation === 270;
+  doc.save();
+  const cx = drawX + drawW / 2;
+  const cy = drawY + drawH / 2;
+  if (rotation) doc.rotate(rotation, { origin: [cx, cy] });
+  const preW = rotated ? drawH : drawW;
+  const preH = rotated ? drawW : drawH;
+  const preX = cx - preW / 2;
+  const preY = cy - preH / 2;
+  if (mirrored) {
+    doc.save();
+    doc.translate(preX + preW, preY).scale(-1, 1);
+    doc.image(buffer, 0, 0, { width: preW, height: preH });
+    doc.restore();
+  } else {
+    doc.image(buffer, preX, preY, { width: preW, height: preH });
+  }
+  doc.restore();
+}
+
+async function drawImageInRect(doc, buffer, rect, mirrored, rotation) {
   const meta = await sharp(buffer).metadata();
-  const imgRatio = meta.width / meta.height;
+  const rotated = rotation === 90 || rotation === 270;
+  const imgRatio = rotated ? meta.height / meta.width : meta.width / meta.height;
   const rectRatio = rect.w / rect.h;
   let drawW, drawH;
   if (imgRatio > rectRatio) {
@@ -168,15 +246,16 @@ async function drawImageInRect(doc, buffer, rect) {
   const drawY = rect.y + (rect.h - drawH) / 2;
 
   doc.rect(rect.x, rect.y, rect.w, rect.h).fill('#eeeeee');
-  doc.image(buffer, drawX, drawY, { width: drawW, height: drawH });
+  drawImageTransformed(doc, buffer, drawX, drawY, drawW, drawH, mirrored, rotation);
 }
 
 // For a photo with a manually chosen crop: the buffer is already the exact
 // crop the user selected, so fill the rect completely (clipping any sliver
 // of rounding error) rather than letterboxing it.
-async function drawImageCover(doc, buffer, rect) {
+async function drawImageCover(doc, buffer, rect, mirrored, rotation) {
   const meta = await sharp(buffer).metadata();
-  const imgRatio = meta.width / meta.height;
+  const rotated = rotation === 90 || rotation === 270;
+  const imgRatio = rotated ? meta.height / meta.width : meta.width / meta.height;
   const rectRatio = rect.w / rect.h;
   let drawW, drawH;
   if (imgRatio > rectRatio) {
@@ -191,7 +270,7 @@ async function drawImageCover(doc, buffer, rect) {
 
   doc.save();
   doc.rect(rect.x, rect.y, rect.w, rect.h).clip();
-  doc.image(buffer, drawX, drawY, { width: drawW, height: drawH });
+  drawImageTransformed(doc, buffer, drawX, drawY, drawW, drawH, mirrored, rotation);
   doc.restore();
 }
 
@@ -219,7 +298,21 @@ async function exportPdf(state, destPath) {
 
     doc.rect(0, 0, PAGE_W, PAGE_H).fill('#ffffff');
 
-    const rects = layoutRects(page.layout, MARGIN, MARGIN, contentW, contentH, gap, page.splits);
+    // A page with any slot resized via its free-form drag handle has
+    // "graduated" out of the named-template grid -- every slot's own rect
+    // (fractions of the content box, seeded from the template at the moment
+    // of the first resize -- see slots/rects route) wins over layoutRects(),
+    // including any gaps left where a shrunk slot no longer reaches a
+    // neighbor.
+    const usesCustomRects = page.slots.some((s) => s.rect);
+    const rects = usesCustomRects
+      ? page.slots.map((slot) => {
+          const r = slot.rect;
+          return r
+            ? { x: MARGIN + r.x * contentW, y: MARGIN + r.y * contentH, w: r.w * contentW, h: r.h * contentH }
+            : { x: MARGIN, y: MARGIN, w: contentW, h: contentH };
+        })
+      : layoutRects(page.layout, MARGIN, MARGIN, contentW, contentH, gap, page.splits);
     for (let i = 0; i < page.slots.length; i++) {
       const slot = page.slots[i];
       const rect = rects[i];
@@ -228,6 +321,8 @@ async function exportPdf(state, destPath) {
         const photo = photosById.get(slot.photoId);
         if (photo) {
           const absPath = photo.absPath;
+          doc.save();
+          clipShape(doc, slot.shape, rect);
           try {
             if (slot.crop) {
               const buffer = await getCroppedBuffer(absPath, slot.crop, 1200);
@@ -237,17 +332,18 @@ async function exportPdf(state, destPath) {
               // construction, always matches exactly, so cover-fill there
               // is just an exact fill with no visible letterboxing.
               if (slot.crop.mode === 'free') {
-                await drawImageInRect(doc, buffer, rect);
+                await drawImageInRect(doc, buffer, rect, slot.mirrored, slot.rotation);
               } else {
-                await drawImageCover(doc, buffer, rect);
+                await drawImageCover(doc, buffer, rect, slot.mirrored, slot.rotation);
               }
             } else {
               const buffer = await getResizedBuffer(absPath, 1200);
-              await drawImageInRect(doc, buffer, rect);
+              await drawImageInRect(doc, buffer, rect, slot.mirrored, slot.rotation);
             }
           } catch (err) {
             doc.rect(rect.x, rect.y, rect.w, rect.h).fill('#dddddd');
           }
+          doc.restore();
         }
       } else {
         doc.rect(rect.x, rect.y, rect.w, rect.h).fill('#f5f5f5');
@@ -262,21 +358,24 @@ async function exportPdf(state, destPath) {
       const photo = photosById.get(float.photoId);
       if (!photo) continue;
       const rect = { x: float.x * PAGE_W, y: float.y * PAGE_H, w: float.w * PAGE_W, h: float.h * PAGE_H };
+      doc.save();
+      clipShape(doc, float.shape, rect);
       try {
         if (float.crop) {
           const buffer = await getCroppedBuffer(photo.absPath, float.crop, 1200);
           if (float.crop.mode === 'free') {
-            await drawImageInRect(doc, buffer, rect);
+            await drawImageInRect(doc, buffer, rect, float.mirrored, float.rotation);
           } else {
-            await drawImageCover(doc, buffer, rect);
+            await drawImageCover(doc, buffer, rect, float.mirrored, float.rotation);
           }
         } else {
           const buffer = await getResizedBuffer(photo.absPath, 1200);
-          await drawImageCover(doc, buffer, rect);
+          await drawImageCover(doc, buffer, rect, float.mirrored, float.rotation);
         }
       } catch (err) {
         // Skip a floating photo that fails to load rather than aborting the whole export.
       }
+      doc.restore();
     }
 
     doc

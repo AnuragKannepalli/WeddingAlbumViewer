@@ -5,7 +5,9 @@
   let currentPageIndex = 0;
   let pickerTarget = null; // { pageId, slotIndex }
   let slotFileTarget = null; // { pageId, slotIndex }
-  let slotDragSource = null; // { pageId, slotIndex } -- set while dragging a filled slot to rearrange it
+  let slotDragSource = null; // { pageId, slotIndex } -- set while dragging a filled slot to rearrange it; cleared on dragend AND the instant any drop reads it (see the slot drop handler)
+  let lastEditUndo = null; // { label, run } -- the one most recent undoable edit, see recordUndo()
+  let hoveredPhoto = null; // { type: 'slot', pageId, slotIndex } | { type: 'float', pageId, float } -- for the Delete key shortcut
 
   // Named sheet-size shortcuts shown in the preset dropdown. Keys must
   // match the <option value="..."> in index.html; anything not matching
@@ -241,14 +243,43 @@
 
   // ---------------- Photo grid rendering ----------------
 
+  // Every slot/float placement of every photo, across every page -- the one
+  // source of truth for "is this photo used, and where." A photoId with 2+
+  // entries means the same library photo was placed in more than one spot,
+  // easy to do by accident in an album with hundreds of photos to recall.
+  function photoUsageMap() {
+    const map = new Map(); // photoId -> [{ pageIndex, pageId, type: 'slot'|'float', slotIndex, floatId }]
+    appState.pages.forEach((page, pageIndex) => {
+      page.slots.forEach((slot, slotIndex) => {
+        if (!slot || !slot.photoId) return;
+        if (!map.has(slot.photoId)) map.set(slot.photoId, []);
+        map.get(slot.photoId).push({ pageIndex, pageId: page.id, type: 'slot', slotIndex });
+      });
+      (page.floats || []).forEach((float) => {
+        if (!float.photoId) return;
+        if (!map.has(float.photoId)) map.set(float.photoId, []);
+        map.get(float.photoId).push({ pageIndex, pageId: page.id, type: 'float', floatId: float.id });
+      });
+    });
+    return map;
+  }
+
   function usedPhotoIds() {
-    const used = new Set();
-    for (const page of appState.pages) {
-      for (const slot of page.slots) {
-        if (slot && slot.photoId) used.add(slot.photoId);
-      }
-    }
-    return used;
+    return new Set(photoUsageMap().keys());
+  }
+
+  // Jumps to the next place (after this one, wrapping around) the same
+  // photo is used -- repeated clicks cycle through every occurrence, not
+  // just back and forth between two.
+  function jumpToOtherUsage(photoId, current) {
+    const locations = photoUsageMap().get(photoId) || [];
+    if (locations.length < 2) return;
+    const currentIdx = current
+      ? locations.findIndex((l) => l.pageId === current.pageId && l.type === current.type &&
+          (current.type === 'slot' ? l.slotIndex === current.slotIndex : l.floatId === current.floatId))
+      : -1;
+    const next = locations[(currentIdx + 1) % locations.length];
+    jumpToPage(next.pageIndex + 1);
   }
 
   function filterPhotos(photos, { search, favOnly, unusedOnly }) {
@@ -261,20 +292,23 @@
     });
   }
 
-  function photoCardHtml(photo, { draggable, selectable, selected }) {
+  function photoCardHtml(photo, { draggable, selectable, selected, usageCount }) {
     return `
       <div class="photo-card ${photo.favorite ? 'favorite' : ''} ${selectable ? 'selectable' : ''} ${selected ? 'selected' : ''}" data-id="${photo.id}" ${draggable ? 'draggable="true"' : ''}>
         ${selectable ? `<label class="select-check-overlay"><input type="checkbox" data-action="select" ${selected ? 'checked' : ''} /></label>` : ''}
         <img src="/api/thumb/${photo.id}" alt="${escapeHtml(photo.filename)}" loading="lazy" />
         <button class="fav-star" title="Toggle favorite" data-action="fav">&#9733;</button>
         ${photo.possibleDuplicate ? '<span class="dup-badge" title="Possible burst/duplicate">dup?</span>' : ''}
+        ${usageCount > 1 ? `<span class="placed-badge" title="Already placed ${usageCount} times in the album">Used &times;${usageCount}</span>` : ''}
         <span class="filename-label">${escapeHtml(photo.filename)}</span>
       </div>`;
   }
 
   function renderPhotoGrid(container, photos, { draggable, onSelect, selectable, selection } = {}) {
+    const usageMap = photoUsageMap();
     container.innerHTML = photos.map((p) => photoCardHtml(p, {
-      draggable, selectable, selected: !!(selection && selection.has(p.id))
+      draggable, selectable, selected: !!(selection && selection.has(p.id)),
+      usageCount: (usageMap.get(p.id) || []).length
     })).join('');
     container.querySelectorAll('.photo-card').forEach((card) => {
       const id = card.dataset.id;
@@ -287,6 +321,11 @@
 
       if (draggable) {
         card.addEventListener('dragstart', (e) => {
+          // A drag starting fresh from the library is never a slot
+          // rearrange, regardless of any leftover slotDragSource from an
+          // earlier slot-to-slot drag whose dragend didn't fire (e.g. its
+          // origin slot got removed from the DOM by a re-render mid-drag).
+          slotDragSource = null;
           e.dataTransfer.setData('text/plain', id);
         });
       }
@@ -435,10 +474,20 @@
 
     $('#pageMoveUp').addEventListener('click', () => movePage('up'));
     $('#pageMoveDown').addEventListener('click', () => movePage('down'));
+    $('#pageDuplicateBtn').addEventListener('click', () => duplicatePage());
+    $('#undoLastEditBtn').addEventListener('click', () => runLastEditUndo());
     $('#pageDeleteBtn').addEventListener('click', () => {
       const page = appState.pages[currentPageIndex];
       if (page) deletePage(page.id);
     });
+
+    $$('#pageShapeOptions .crop-shape-option').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const shape = btn.dataset.shape === 'none' ? null : btn.dataset.shape;
+        applyPageStyle({ shape });
+      });
+    });
+    $('#pageMirrorAllBtn').addEventListener('click', () => applyPageStyle({ mirrored: true }));
 
     $('#jumpToPageInput').addEventListener('keydown', (e) => {
       if (e.key !== 'Enter') return;
@@ -570,6 +619,39 @@
       flashError(err.message);
     }
     renderEditorTab();
+  }
+
+  async function duplicatePage() {
+    const page = appState.pages[currentPageIndex];
+    if (!page) return;
+    try {
+      const data = await api('POST', `/api/pages/${page.id}/duplicate`, {});
+      appState.pages = data.pages;
+      currentPageIndex = appState.pages.findIndex((p) => p.id === data.newPageId);
+      flashSaved();
+    } catch (err) {
+      flashError(err.message);
+    }
+    $('#pageCountInput').value = appState.pages.length;
+    renderEditorCanvas();
+    renderPageRail();
+  }
+
+  // Applies one shape and/or mirrored setting to every filled photo on the
+  // current page in a single call -- the "whole page at once" counterpart
+  // to picking a shape/mirror for one photo at a time in the Edit modal.
+  async function applyPageStyle(body) {
+    const page = appState.pages[currentPageIndex];
+    if (!page) return;
+    try {
+      const data = await api('PUT', `/api/pages/${page.id}/bulk-style`, body);
+      const pageIdx = appState.pages.findIndex((p) => p.id === page.id);
+      if (pageIdx !== -1) appState.pages[pageIdx] = data.page;
+      flashSaved();
+    } catch (err) {
+      flashError(err.message);
+    }
+    renderEditorCanvas();
   }
 
   function jumpToPage(pageNumber) {
@@ -785,7 +867,7 @@
     }
   }
 
-  function buildSlotElement(page, slot, idx) {
+  function buildSlotElement(page, slot, idx, stage, usageMap) {
     const slotEl = document.createElement('div');
     slotEl.className = 'slot' + (slot.photoId ? ' filled' : '');
     slotEl.dataset.slotIndex = idx;
@@ -793,22 +875,33 @@
     if (slot.photoId) {
       const photo = appState.photos.find((p) => p.id === slot.photoId);
       const isFreeCrop = slot.crop && slot.crop.mode === 'free';
-      const cropStyle = slot.crop && !isFreeCrop
+      const cropStyle = (slot.crop && !isFreeCrop
         ? `position:absolute; left:${(-slot.crop.x / slot.crop.w * 100).toFixed(3)}%; top:${(-slot.crop.y / slot.crop.h * 100).toFixed(3)}%; width:${(100 / slot.crop.w).toFixed(3)}%; height:${(100 / slot.crop.h).toFixed(3)}%; object-fit:fill;`
-        : '';
+        : '') + photoTransformStyle(slot.mirrored, slot.rotation);
       const imgSrc = isFreeCrop
         ? `/api/crop-preview/${slot.photoId}?x=${slot.crop.x}&y=${slot.crop.y}&w=${slot.crop.w}&h=${slot.crop.h}`
         : `/api/thumb/${slot.photoId}`;
+      const usageLocations = (usageMap && usageMap.get(slot.photoId)) || [];
+      const usedElsewhere = usageLocations.length > 1;
       slotEl.innerHTML = `
         ${slot.hero ? '<span class="hero-tag">HERO</span>' : ''}
-        <img src="${imgSrc}" alt="${photo ? escapeHtml(photo.filename) : ''}" title="Click to view full size" style="${cropStyle}" />
+        <div class="photo-clip shape-${slot.shape || 'none'}">
+          <img src="${imgSrc}" alt="${photo ? escapeHtml(photo.filename) : ''}" title="Click to view full size" style="${cropStyle}" />
+        </div>
+        ${usedElsewhere ? `<button class="usage-badge" title="This photo is used ${usageLocations.length} times in the album -- click to jump to the next spot">&#9888; &times;${usageLocations.length}</button>` : ''}
         <div class="slot-actions">
-          <button class="slot-crop-btn" title="Adjust crop">&#9986;</button>
+          <button class="slot-crop-btn" title="Edit">&#9986;</button>
           <button class="hero-toggle-btn" title="Toggle hero">${slot.hero ? '&#9733;' : '&#9734;'}</button>
           <button class="slot-library-btn" title="Pick from already-added photos">&#9638;</button>
           <button class="slot-remove-btn" title="Remove photo, then add a new one">&times;</button>
         </div>
       `;
+      if (usedElsewhere) {
+        slotEl.querySelector('.usage-badge').addEventListener('click', (e) => {
+          e.stopPropagation();
+          jumpToOtherUsage(slot.photoId, { pageId: page.id, type: 'slot', slotIndex: idx });
+        });
+      }
       slotEl.querySelector('.slot-crop-btn').addEventListener('click', (e) => {
         e.stopPropagation();
         openCropEditor(page.id, idx);
@@ -826,6 +919,15 @@
         await assignSlot(page.id, idx, { remove: true });
       });
       slotEl.addEventListener('click', () => openLightbox(slot.photoId));
+
+      // Tracks which photo the mouse is over so the Delete key (see
+      // initKeyboardShortcuts) knows what to remove without needing a
+      // separate click-to-select state.
+      const slotHoverTarget = { type: 'slot', pageId: page.id, slotIndex: idx };
+      slotEl.addEventListener('mouseenter', () => { hoveredPhoto = slotHoverTarget; });
+      slotEl.addEventListener('mouseleave', () => {
+        if (hoveredPhoto === slotHoverTarget) hoveredPhoto = null;
+      });
 
       // Without this, dragging a filled slot's <img> falls back to the
       // browser's native "drag this image out" behavior (since <img>
@@ -867,24 +969,44 @@
       e.stopPropagation();
       slotEl.classList.remove('drag-over');
 
-      // A drag from File Explorer (or any source that hands over a real
-      // file) arrives here -- upload it directly, no server round-trip for
-      // a URL needed. (OneDrive's own web UI does NOT do this: it only
-      // shares internal item references meaningful to other Microsoft 365
-      // apps, not an actual file or URL, so dragging straight from
-      // onedrive.com can't be supported this way -- see hint text above.)
-      if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      // Check for a recognized in-app photo FIRST, before even looking at
+      // dataTransfer.files. Dragging a filled slot's own <img> (or a
+      // library card's <img>) is purely an in-page drag, but some browsers
+      // (Chrome at least) ALSO populate dataTransfer.files with a synthetic
+      // image file for that gesture, the same way they would for a real
+      // drop from outside the browser -- so files.length > 0 alone can't
+      // tell a genuine external file apart from this. A real external drop
+      // never carries a text/plain payload matching one of our own photo
+      // ids, so checking that first is unambiguous either way.
+      const photoId = e.dataTransfer.getData('text/plain');
+      const isKnownPhoto = photoId && appState.photos.some((p) => p.id === photoId);
+
+      if (!isKnownPhoto && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+        // A drag from File Explorer (or any source that hands over a real
+        // file) arrives here -- upload it directly, no server round-trip
+        // for a URL needed. (OneDrive's own web UI does NOT do this: it
+        // only shares internal item references meaningful to other
+        // Microsoft 365 apps, not an actual file or URL, so dragging
+        // straight from onedrive.com can't be supported this way -- see
+        // hint text above.)
         await importFileIntoSlot(page.id, idx, e.dataTransfer.files[0], slotEl);
         return;
       }
 
-      const photoId = e.dataTransfer.getData('text/plain');
-      if (photoId && appState.photos.some((p) => p.id === photoId)) {
-        if (slotDragSource && slotDragSource.pageId === page.id && slotDragSource.slotIndex !== idx) {
+      if (isKnownPhoto) {
+        // slotDragSource is consumed (cleared) the instant it's read here,
+        // not only later on dragend -- so even if dragend never fires on
+        // its origin slot (e.g. that element got removed from the DOM by a
+        // re-render before the drag concluded), a stale value can only
+        // ever affect this one drop, never linger to misinterpret a later,
+        // unrelated one.
+        const slotSource = slotDragSource;
+        slotDragSource = null;
+        if (slotSource && slotSource.pageId === page.id && slotSource.slotIndex !== idx) {
           // Dragged from another slot on this same page -- rearrange (swap
           // whichever photo is already here, if any, back into the source
           // slot) rather than just overwriting this one.
-          await swapSlots(page.id, slotDragSource.slotIndex, idx);
+          await swapSlots(page.id, slotSource.slotIndex, idx);
         } else {
           await assignSlot(page.id, idx, { photoId });
         }
@@ -894,7 +1016,233 @@
       if (external) await importUrlIntoSlot(page.id, idx, external, slotEl);
     });
 
+    appendResizeHandles(slotEl);
+    wireSlotResize(slotEl, stage, page, idx);
+
     return slotEl;
+  }
+
+  // Shared by slots and floats: the CSS transform for a photo's mirror/
+  // rotation state, composed so mirroring happens first (in the photo's own
+  // space) and rotation second -- matching the order server/pdfExporter.js
+  // uses for the PDF export, so the preview and the printed result agree.
+  function photoTransformStyle(mirrored, rotation) {
+    const parts = [];
+    if (rotation) parts.push(`rotate(${rotation}deg)`);
+    if (mirrored) parts.push('scaleX(-1)');
+    return parts.length ? ` transform:${parts.join(' ')};` : '';
+  }
+
+  // Shared by both floating photos and free-form slot resizing: 8 drag
+  // handles (4 corners + 4 edge midpoints) around a box, so any side can be
+  // pulled to resize it, not just the bottom-right corner.
+  const RESIZE_DIRS = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'];
+  function appendResizeHandles(el) {
+    RESIZE_DIRS.forEach((dir) => {
+      const h = document.createElement('div');
+      h.className = `resize-handle resize-${dir}`;
+      h.dataset.dir = dir;
+      h.title = 'Drag to resize';
+      // A click with no movement in between still fires a 'click' after the
+      // mousedown/mouseup below -- stop it from bubbling to the slot/tile's
+      // own click handler (e.g. a slot opens the lightbox on click).
+      h.addEventListener('click', (e) => e.stopPropagation());
+      el.appendChild(h);
+    });
+  }
+
+  // Free (non-aspect-locked) resize of a rect {x,y,w,h} from whichever
+  // edge(s) `dir` names, clamped to stay within the [0,1] content box --
+  // used for slots, where the photo inside just letterboxes/covers to fit
+  // whatever box shape you drag out, unlike a floating photo's fixed frame.
+  function resizeRectFree(start, dir, dxFrac, dyFrac, minSize) {
+    let { x, y, w, h } = start;
+    if (dir.includes('e')) w = Math.max(minSize, start.w + dxFrac);
+    if (dir.includes('w')) { w = Math.max(minSize, start.w - dxFrac); x = start.x + start.w - w; }
+    if (dir.includes('s')) h = Math.max(minSize, start.h + dyFrac);
+    if (dir.includes('n')) { h = Math.max(minSize, start.h - dyFrac); y = start.y + start.h - h; }
+    x = Math.max(0, Math.min(x, 1 - w));
+    y = Math.max(0, Math.min(y, 1 - h));
+    w = Math.min(w, 1 - x);
+    h = Math.min(h, 1 - y);
+    return { x, y, w, h };
+  }
+
+  // Aspect-locked resize of a rect {x,y,w,h} from whichever edge/corner
+  // `dir` names, keeping w/h at `aspectWPerH` throughout -- used for
+  // floating photos, which (per their existing single-handle resize) never
+  // stretch the photo out of its own proportions. The edge/corner opposite
+  // the one being dragged stays anchored in place; for a pure edge handle
+  // (no coupled corner), the perpendicular axis stays centered instead.
+  function computeAspectResize(start, dir, dxFrac, dyFrac, aspectWPerH, minSize) {
+    let w = start.w;
+    let h = start.h;
+    if (dir === 'n' || dir === 's') {
+      h = dir === 's' ? start.h + dyFrac : start.h - dyFrac;
+      h = Math.max(minSize, h);
+      w = h * aspectWPerH;
+    } else {
+      w = dir.includes('e') ? start.w + dxFrac : start.w - dxFrac;
+      w = Math.max(minSize, w);
+      h = w / aspectWPerH;
+    }
+    if (h < minSize) { h = minSize; w = h * aspectWPerH; }
+
+    const cx = start.x + start.w / 2;
+    const cy = start.y + start.h / 2;
+    let x = dir.includes('w') ? start.x + start.w - w : dir.includes('e') ? start.x : cx - w / 2;
+    let y = dir.includes('n') ? start.y + start.h - h : dir.includes('s') ? start.y : cy - h / 2;
+    return { x, y, w, h };
+  }
+
+  // Once any slot on a page has a stored `rect`, the whole page renders from
+  // those fractions (of the content box) instead of the named-template grid
+  // -- every slot must have a rect by that point (seeded all at once, see
+  // wireSlotResize), so a missing one here just falls back to the full box.
+  function buildCustomRectContainer(page, slotElements) {
+    const outer = document.createElement('div');
+    outer.className = 'page-custom-rects';
+    page.slots.forEach((slot, i) => {
+      const el = slotElements[i];
+      const rect = slot.rect || { x: 0, y: 0, w: 1, h: 1 };
+      el.style.left = `${rect.x * 100}%`;
+      el.style.top = `${rect.y * 100}%`;
+      el.style.width = `${rect.w * 100}%`;
+      el.style.height = `${rect.h * 100}%`;
+      outer.appendChild(el);
+    });
+    return outer;
+  }
+
+  // Reads each currently-rendered slot's on-screen box (under whichever
+  // named-template layout is active right now) as a fraction of the overall
+  // layout container, so a free-form resize can seed every slot's starting
+  // rect without jumping -- works for any layout shape (grid/rows/region)
+  // since it just looks for .slot elements wherever they ended up.
+  function measureCurrentSlotRects(stage) {
+    const layoutBox = stage.querySelector('.page-grid, .page-rows, .page-region-split, .page-equal-cols');
+    if (!layoutBox) return null;
+    const boxRect = layoutBox.getBoundingClientRect();
+    if (!boxRect.width || !boxRect.height) return null;
+    const rects = [];
+    layoutBox.querySelectorAll('.slot').forEach((el) => {
+      const idx = parseInt(el.dataset.slotIndex, 10);
+      const r = el.getBoundingClientRect();
+      rects[idx] = {
+        x: (r.left - boxRect.left) / boxRect.width,
+        y: (r.top - boxRect.top) / boxRect.height,
+        w: r.width / boxRect.width,
+        h: r.height / boxRect.height
+      };
+    });
+    return rects;
+  }
+
+  // After resizing `movedIdx`'s rect (from any side, not just its bottom-
+  // right corner), shrinks any other slot it now overlaps just enough to
+  // clear the overlap -- pulling in whichever of the neighbor's edges faces
+  // the moved slot (decided by comparing centers, since the moved slot can
+  // now have encroached from any direction, not just grown right/down).
+  // Neighbors further away are left untouched, so a shrink never cascades
+  // and the vacated space is simply left as empty page -- matches floats,
+  // which likewise never resize each other.
+  function resolveSlotOverlaps(page, movedIdx) {
+    const MIN = 0.05;
+    const moved = page.slots[movedIdx].rect;
+    const movedCx = moved.x + moved.w / 2;
+    const movedCy = moved.y + moved.h / 2;
+    page.slots.forEach((s, i) => {
+      if (i === movedIdx || !s.rect) return;
+      const other = s.rect;
+      const overlapX = Math.min(moved.x + moved.w, other.x + other.w) - Math.max(moved.x, other.x);
+      const overlapY = Math.min(moved.y + moved.h, other.y + other.h) - Math.max(moved.y, other.y);
+      if (overlapX <= 0 || overlapY <= 0) return;
+      const otherCx = other.x + other.w / 2;
+      const otherCy = other.y + other.h / 2;
+      if (overlapX <= overlapY) {
+        if (otherCx >= movedCx) {
+          const newX = moved.x + moved.w;
+          other.w = Math.max(MIN, other.x + other.w - newX);
+          other.x = newX;
+        } else {
+          other.w = Math.max(MIN, moved.x - other.x);
+        }
+      } else if (otherCy >= movedCy) {
+        const newY = moved.y + moved.h;
+        other.h = Math.max(MIN, other.y + other.h - newY);
+        other.y = newY;
+      } else {
+        other.h = Math.max(MIN, moved.y - other.y);
+      }
+    });
+  }
+
+  // Lets a slot grow (or shrink) past its template-assigned box from any of
+  // its 8 drag handles, same mechanic as a floating photo's resize handles
+  // -- the first drag on a page "graduates" it out of the grid (see
+  // buildCustomRectContainer), seeding every slot's current position so
+  // nothing else jumps.
+  function wireSlotResize(slotEl, stage, page, idx) {
+    slotEl.querySelectorAll('.resize-handle').forEach((handle) => {
+      const dir = handle.dataset.dir;
+      handle.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+
+        // Resolve the current page object fresh (not the one closed over
+        // from whichever render pass created this element) -- another edit
+        // made since then (a crop, a hero toggle) may have already swapped
+        // appState.pages[idx] for a new object from the server.
+        const livePage = appState.pages.find((p) => p.id === page.id);
+        if (!livePage) return;
+
+        if (!livePage.slots.some((s) => s.rect)) {
+          const measured = measureCurrentSlotRects(stage);
+          if (!measured) return;
+          livePage.slots.forEach((s, i) => { s.rect = measured[i] || { x: 0, y: 0, w: 1, h: 1 }; });
+          renderEditorCanvas();
+        }
+
+        const layoutBox = stage.querySelector('.page-custom-rects');
+        const curSlotEl = stage.querySelector(`.slot[data-slot-index="${idx}"]`);
+        if (!layoutBox || !curSlotEl) return;
+        const boxRect = layoutBox.getBoundingClientRect();
+        const start = { ...livePage.slots[idx].rect };
+        const startX = e.clientX;
+        const startY = e.clientY;
+        const MIN = 0.06;
+
+        const onMove = (moveEvent) => {
+          const dxFrac = (moveEvent.clientX - startX) / boxRect.width;
+          const dyFrac = (moveEvent.clientY - startY) / boxRect.height;
+          const next = resizeRectFree(start, dir, dxFrac, dyFrac, MIN);
+          livePage.slots[idx].rect = next;
+          curSlotEl.style.left = `${next.x * 100}%`;
+          curSlotEl.style.top = `${next.y * 100}%`;
+          curSlotEl.style.width = `${next.w * 100}%`;
+          curSlotEl.style.height = `${next.h * 100}%`;
+        };
+        const onUp = async () => {
+          window.removeEventListener('mousemove', onMove);
+          window.removeEventListener('mouseup', onUp);
+          resolveSlotOverlaps(livePage, idx);
+          try {
+            const data = await api('PUT', `/api/pages/${livePage.id}/slots/rects`, {
+              rects: livePage.slots.map((s) => s.rect || null)
+            });
+            const pageIdx = appState.pages.findIndex((p) => p.id === livePage.id);
+            if (pageIdx !== -1) appState.pages[pageIdx] = data.page;
+            flashSaved();
+          } catch (err) {
+            flashError(err.message);
+          }
+          renderEditorCanvas();
+          renderPageRail();
+        };
+        window.addEventListener('mousemove', onMove);
+        window.addEventListener('mouseup', onUp);
+      });
+    });
   }
 
   function buildRowsContainer(page, slotElements) {
@@ -1174,10 +1522,13 @@
       return;
     }
 
-    const slotElements = page.slots.map((slot, idx) => buildSlotElement(page, slot, idx));
+    const usageMap = photoUsageMap();
+    const slotElements = page.slots.map((slot, idx) => buildSlotElement(page, slot, idx, stage, usageMap));
 
     stage.innerHTML = '';
-    if (LAYOUT_ROWS[page.layout]) {
+    if (page.slots.some((s) => s.rect)) {
+      stage.appendChild(buildCustomRectContainer(page, slotElements));
+    } else if (LAYOUT_ROWS[page.layout]) {
       stage.appendChild(buildRowsContainer(page, slotElements));
     } else if (LAYOUT_REGION_DEFS[page.layout]) {
       const def = LAYOUT_REGION_DEFS[page.layout];
@@ -1199,7 +1550,7 @@
       stage.appendChild(grid);
       renderSplitDividers(grid, page);
     }
-    renderFloatsLayer(stage, page);
+    renderFloatsLayer(stage, page, usageMap);
   }
 
   function layoutLabelFor(layoutId) {
@@ -1214,7 +1565,7 @@
   // grid/rows inside it) so their 0-100% left/top/width/height span the
   // whole sheet, matching how the PDF export places them -- letting them
   // reach every corner or overlap the main photo(s).
-  function renderFloatsLayer(stage, page) {
+  function renderFloatsLayer(stage, page, usageMap) {
     for (const float of page.floats || []) {
       const tile = document.createElement('div');
       tile.className = 'float-tile';
@@ -1224,38 +1575,51 @@
       tile.style.width = `${float.w * 100}%`;
       tile.style.height = `${float.h * 100}%`;
       const isFreeCrop = float.crop && float.crop.mode === 'free';
-      const cropStyle = isFreeCrop
+      const cropStyle = (isFreeCrop
         ? 'object-fit:contain;'
         : float.crop
           ? `position:absolute; left:${(-float.crop.x / float.crop.w * 100).toFixed(3)}%; top:${(-float.crop.y / float.crop.h * 100).toFixed(3)}%; width:${(100 / float.crop.w).toFixed(3)}%; height:${(100 / float.crop.h).toFixed(3)}%; object-fit:fill;`
-          : '';
+          : '') + photoTransformStyle(float.mirrored, float.rotation);
       const imgSrc = isFreeCrop
         ? `/api/crop-preview/${float.photoId}?x=${float.crop.x}&y=${float.crop.y}&w=${float.crop.w}&h=${float.crop.h}`
         : `/api/thumb/${float.photoId}`;
+      const usageLocations = (usageMap && usageMap.get(float.photoId)) || [];
+      const usedElsewhere = usageLocations.length > 1;
       tile.innerHTML = `
-        <img src="${imgSrc}" alt="" draggable="false" style="${cropStyle}" />
-        <button class="float-crop-btn" title="Adjust crop">&#9986;</button>
-        <button class="float-remove-btn" title="Remove">&times;</button>
-        <div class="float-resize-handle" title="Drag to resize"></div>
+        <div class="photo-clip shape-${float.shape || 'none'}">
+          <img src="${imgSrc}" alt="" draggable="false" style="${cropStyle}" />
+        </div>
+        ${usedElsewhere ? `<button class="usage-badge" title="This photo is used ${usageLocations.length} times in the album -- click to jump to the next spot">&#9888; &times;${usageLocations.length}</button>` : ''}
+        <div class="float-actions">
+          <button class="float-crop-btn" title="Edit">&#9986;</button>
+          <button class="float-remove-btn" title="Remove">&times;</button>
+        </div>
       `;
+      if (usedElsewhere) {
+        tile.querySelector('.usage-badge').addEventListener('click', (e) => {
+          e.stopPropagation();
+          jumpToOtherUsage(float.photoId, { pageId: page.id, type: 'float', floatId: float.id });
+        });
+      }
+      appendResizeHandles(tile);
       wireFloatDrag(tile, stage, page, float);
       wireFloatResize(tile, stage, page, float);
       wireFloatPhotoDrop(tile, page, float);
+
+      // Same hover-tracking the Delete key relies on for slots -- see the
+      // comment in buildSlotElement.
+      const floatHoverTarget = { type: 'float', pageId: page.id, float };
+      tile.addEventListener('mouseenter', () => { hoveredPhoto = floatHoverTarget; });
+      tile.addEventListener('mouseleave', () => {
+        if (hoveredPhoto === floatHoverTarget) hoveredPhoto = null;
+      });
       tile.querySelector('.float-crop-btn').addEventListener('click', (e) => {
         e.stopPropagation();
         openFloatCropEditor(page.id, float.id);
       });
-      tile.querySelector('.float-remove-btn').addEventListener('click', async (e) => {
+      tile.querySelector('.float-remove-btn').addEventListener('click', (e) => {
         e.stopPropagation();
-        try {
-          const data = await api('DELETE', `/api/pages/${page.id}/floats/${float.id}`);
-          const pageIdx = appState.pages.findIndex((p) => p.id === page.id);
-          if (pageIdx !== -1) appState.pages[pageIdx] = data.page;
-          flashSaved();
-        } catch (err) {
-          flashError(err.message);
-        }
-        renderEditorCanvas();
+        removeFloat(page.id, float);
       });
       stage.appendChild(tile);
     }
@@ -1280,12 +1644,18 @@
       e.stopPropagation();
       tile.classList.remove('drag-over');
 
-      if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      // See the matching comment in the slot drop handler: check for a
+      // recognized in-app photo before dataTransfer.files, since some
+      // browsers populate files with a synthetic image for an in-page
+      // <img> drag too, not just a real drop from outside the browser.
+      const photoId = e.dataTransfer.getData('text/plain');
+      const isKnownPhoto = photoId && appState.photos.some((p) => p.id === photoId);
+
+      if (!isKnownPhoto && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
         await importFileIntoFloat(page.id, float.id, e.dataTransfer.files[0], tile);
         return;
       }
-      const photoId = e.dataTransfer.getData('text/plain');
-      if (photoId && appState.photos.some((p) => p.id === photoId)) {
+      if (isKnownPhoto) {
         await setFloatPhoto(page.id, float.id, photoId);
         return;
       }
@@ -1295,8 +1665,11 @@
   }
 
   async function setFloatPhoto(pageId, floatId, photoId) {
+    // Same "keep crop/shape when replacing" toolbar checkbox as assignSlot
+    // honors for slots -- see the comment there.
+    const keepCrop = $('#keepCropOnReplaceToggle').checked;
     try {
-      const data = await api('PUT', `/api/pages/${pageId}/floats/${floatId}`, { photoId });
+      const data = await api('PUT', `/api/pages/${pageId}/floats/${floatId}`, { photoId, keepCrop });
       const pageIdx = appState.pages.findIndex((p) => p.id === pageId);
       if (pageIdx !== -1) appState.pages[pageIdx] = data.page;
       flashSaved();
@@ -1340,7 +1713,7 @@
 
   function wireFloatDrag(tile, stage, page, float) {
     tile.addEventListener('mousedown', (e) => {
-      if (e.target.closest('.float-remove-btn') || e.target.closest('.float-resize-handle')) return;
+      if (e.target.closest('.float-remove-btn') || e.target.closest('.resize-handle') || e.target.closest('.float-crop-btn') || e.target.closest('.usage-badge')) return;
       e.preventDefault();
       const stageRect = stage.getBoundingClientRect();
       const startLeftFrac = float.x;
@@ -1374,45 +1747,65 @@
   }
 
   function wireFloatResize(tile, stage, page, float) {
-    const handle = tile.querySelector('.float-resize-handle');
-    handle.addEventListener('mousedown', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      const stageRect = stage.getBoundingClientRect();
-      const img = tile.querySelector('img');
-      // Keep the photo's own aspect ratio while resizing, corrected for the
-      // page's width:height ratio (a fraction of page-width and a fraction
-      // of page-height aren't the same physical size unless the page is
-      // square), so dragging the corner never stretches the photo.
-      const { widthIn, heightIn } = appState.pageSize || { widthIn: 11, heightIn: 8.5 };
-      const pageAspect = widthIn / heightIn;
-      const imgAspect = img.naturalWidth && img.naturalHeight ? img.naturalWidth / img.naturalHeight : (float.w * pageAspect) / float.h;
-      const startW = float.w;
-      const startX = e.clientX;
+    tile.querySelectorAll('.resize-handle').forEach((handle) => {
+      const dir = handle.dataset.dir;
+      handle.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const stageRect = stage.getBoundingClientRect();
+        const img = tile.querySelector('img');
+        // Keep the photo's own aspect ratio while resizing, corrected for
+        // the page's width:height ratio (a fraction of page-width and a
+        // fraction of page-height aren't the same physical size unless the
+        // page is square), so dragging any handle never stretches the
+        // photo -- same as the single corner handle this replaces, just
+        // from whichever side/corner you grab, with the opposite side
+        // staying anchored in place.
+        const { widthIn, heightIn } = appState.pageSize || { widthIn: 11, heightIn: 8.5 };
+        const pageAspect = widthIn / heightIn;
+        const imgAspect = img.naturalWidth && img.naturalHeight ? img.naturalWidth / img.naturalHeight : (float.w * pageAspect) / float.h;
+        const aspectWPerH = imgAspect / pageAspect;
+        const start = { x: float.x, y: float.y, w: float.w, h: float.h };
+        const startX = e.clientX;
+        const startY = e.clientY;
+        const MIN = 0.03;
 
-      const onMove = (moveEvent) => {
-        const dwFrac = (moveEvent.clientX - startX) / stageRect.width;
-        const w = Math.min(1, Math.max(0.03, startW + dwFrac));
-        const h = Math.min(1, Math.max(0.03, (w * pageAspect) / imgAspect));
-        float.w = w;
-        float.h = h;
-        tile.style.width = `${w * 100}%`;
-        tile.style.height = `${h * 100}%`;
-      };
-      const onUp = async () => {
-        window.removeEventListener('mousemove', onMove);
-        window.removeEventListener('mouseup', onUp);
-        try {
-          const data = await api('PUT', `/api/pages/${page.id}/floats/${float.id}`, { w: float.w, h: float.h });
-          const pageIdx = appState.pages.findIndex((p) => p.id === page.id);
-          if (pageIdx !== -1) appState.pages[pageIdx] = data.page;
-          flashSaved();
-        } catch (err) {
-          flashError(err.message);
-        }
-      };
-      window.addEventListener('mousemove', onMove);
-      window.addEventListener('mouseup', onUp);
+        const onMove = (moveEvent) => {
+          const dxFrac = (moveEvent.clientX - startX) / stageRect.width;
+          const dyFrac = (moveEvent.clientY - startY) / stageRect.height;
+          const next = computeAspectResize(start, dir, dxFrac, dyFrac, aspectWPerH, MIN);
+          // A floating photo may hang partway off the page edge by design
+          // (see wireFloatDrag), so position is clamped relative to its own
+          // half-size, same convention as moving it, not hard-clamped to
+          // [0,1] the way a slot's rect is.
+          next.x = Math.min(1 - next.w / 2, Math.max(-next.w / 2, next.x));
+          next.y = Math.min(1 - next.h / 2, Math.max(-next.h / 2, next.y));
+          float.x = next.x;
+          float.y = next.y;
+          float.w = next.w;
+          float.h = next.h;
+          tile.style.left = `${next.x * 100}%`;
+          tile.style.top = `${next.y * 100}%`;
+          tile.style.width = `${next.w * 100}%`;
+          tile.style.height = `${next.h * 100}%`;
+        };
+        const onUp = async () => {
+          window.removeEventListener('mousemove', onMove);
+          window.removeEventListener('mouseup', onUp);
+          try {
+            const data = await api('PUT', `/api/pages/${page.id}/floats/${float.id}`, {
+              x: float.x, y: float.y, w: float.w, h: float.h
+            });
+            const pageIdx = appState.pages.findIndex((p) => p.id === page.id);
+            if (pageIdx !== -1) appState.pages[pageIdx] = data.page;
+            flashSaved();
+          } catch (err) {
+            flashError(err.message);
+          }
+        };
+        window.addEventListener('mousemove', onMove);
+        window.addEventListener('mouseup', onUp);
+      });
     });
   }
 
@@ -1448,12 +1841,47 @@
       e.preventDefault();
       stage.classList.remove('stage-drag-over');
       const page = appState.pages[currentPageIndex];
-      if (!page || !e.dataTransfer.files || e.dataTransfer.files.length === 0) return;
+      if (!page) return;
       const stageRect = stage.getBoundingClientRect();
       const dropX = (e.clientX - stageRect.left) / stageRect.width;
       const dropY = (e.clientY - stageRect.top) / stageRect.height;
-      await importFileAsFloat(page.id, e.dataTransfer.files[0], dropX, dropY);
+
+      // Check for a recognized in-app photo (dragged from the library or
+      // out of a slot) BEFORE dataTransfer.files -- some browsers populate
+      // files with a synthetic image for an in-page <img> drag too, not
+      // just a real drop from outside the browser, and this handler used
+      // to trust files.length alone, which meant dragging an EXISTING
+      // library photo onto the background was silently uploading a brand
+      // new duplicate copy of it instead of reusing the original.
+      const photoId = e.dataTransfer.getData('text/plain');
+      if (photoId && appState.photos.some((p) => p.id === photoId)) {
+        await addFloatAtPosition(page.id, photoId, dropX, dropY);
+        return;
+      }
+      if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+        await importFileAsFloat(page.id, e.dataTransfer.files[0], dropX, dropY);
+      }
     });
+  }
+
+  // Adds an EXISTING library photo as a new floating photo, centered on the
+  // actual drop point rather than the usual default staggered corner --
+  // same re-centering idea as importFileAsFloat below, just for a photo
+  // that's already in the library instead of a freshly uploaded one.
+  async function addFloatAtPosition(pageId, photoId, dropX, dropY) {
+    try {
+      const data = await api('POST', `/api/pages/${pageId}/floats`, { photoId });
+      const newFloat = data.page.floats[data.page.floats.length - 1];
+      const x = Math.min(1 - newFloat.w / 2, Math.max(-newFloat.w / 2, dropX - newFloat.w / 2));
+      const y = Math.min(1 - newFloat.h / 2, Math.max(-newFloat.h / 2, dropY - newFloat.h / 2));
+      const moveData = await api('PUT', `/api/pages/${pageId}/floats/${newFloat.id}`, { x, y });
+      const pageIdx = appState.pages.findIndex((p) => p.id === pageId);
+      if (pageIdx !== -1) appState.pages[pageIdx] = moveData.page;
+      flashSaved();
+    } catch (err) {
+      flashError(err.message);
+    }
+    renderEditorCanvas();
   }
 
   async function importFileAsFloat(pageId, file, dropX, dropY) {
@@ -1676,9 +2104,223 @@
     renderPageRail();
   }
 
+  // Records the single most recent undoable edit (one level only -- a
+  // second recording always replaces the first, it never stacks). `run` is
+  // called with no arguments when the user clicks "Undo Last Edit" or
+  // presses Ctrl+Z; since undoing an edit is itself an edit, it records its
+  // own undo in turn, so pressing the shortcut twice in a row acts like a
+  // redo rather than doing nothing on the second press.
+  function recordUndo(label, run) {
+    lastEditUndo = { label, run };
+    const btn = $('#undoLastEditBtn');
+    if (btn) {
+      btn.disabled = false;
+      btn.title = `Undo: ${label}`;
+    }
+  }
+
+  async function runLastEditUndo() {
+    if (!lastEditUndo) return;
+    await lastEditUndo.run();
+  }
+
+  // Esc closes whichever modal happens to be open, trying each one's own
+  // close path (not just stripping the .active class) so any state that
+  // close path also clears -- pickerTarget, cropState, oneDriveState --
+  // doesn't linger stale for the next time that modal opens.
+  function closeAnyOpenModal() {
+    if (cropState) { closeCropEditor(); return true; }
+    if ($('#pickerModal').classList.contains('active')) { closePicker(); return true; }
+    if ($('#layoutModal').classList.contains('active')) { closeLayoutModal(); return true; }
+    if ($('#oneDriveModal').classList.contains('active')) { closeOneDriveModal(); return true; }
+    if ($('#lightbox').classList.contains('active')) { $('#lightbox').classList.remove('active'); return true; }
+    return false;
+  }
+
+  function goToAdjacentPage(delta) {
+    if (!appState.pages.length) return;
+    jumpToPage(currentPageIndex + 1 + delta);
+  }
+
+  // Global shortcuts: Esc closes the open modal from anywhere; the rest
+  // only act while actually typing nowhere (so they don't hijack a search
+  // box or a number input) and, except undo, only on the Editor tab where
+  // they're meaningful.
+  function initKeyboardShortcuts() {
+    document.addEventListener('keydown', async (e) => {
+      if (e.key === 'Escape') {
+        closeAnyOpenModal();
+        return;
+      }
+
+      const tag = (e.target.tagName || '').toLowerCase();
+      const typing = tag === 'input' || tag === 'textarea' || tag === 'select' || e.target.isContentEditable;
+      if (typing) return;
+
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+        e.preventDefault();
+        await runLastEditUndo();
+        return;
+      }
+
+      const editorTab = $('#tab-editor');
+      if (!editorTab || !editorTab.classList.contains('active')) return;
+
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        goToAdjacentPage(-1);
+        return;
+      }
+      if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        goToAdjacentPage(1);
+        return;
+      }
+
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        if (!hoveredPhoto) return;
+        e.preventDefault();
+        const target = hoveredPhoto;
+        hoveredPhoto = null;
+        if (target.type === 'slot') {
+          await assignSlot(target.pageId, target.slotIndex, { remove: true });
+        } else {
+          await removeFloat(target.pageId, target.float);
+        }
+      }
+    });
+  }
+
+  // Shared by the float's own remove button and the Delete-key shortcut
+  // (see initKeyboardShortcuts). Records a one-level undo that recreates
+  // the float -- DELETE doesn't come back, so undoing it means a fresh id
+  // from a new POST, then restoring its other fields in a follow-up PUT.
+  async function removeFloat(pageId, float) {
+    const removedFloat = JSON.parse(JSON.stringify(float));
+    try {
+      const data = await api('DELETE', `/api/pages/${pageId}/floats/${float.id}`);
+      const pageIdx = appState.pages.findIndex((p) => p.id === pageId);
+      if (pageIdx !== -1) appState.pages[pageIdx] = data.page;
+      flashSaved();
+      recordUndo('remove floating photo', async () => {
+        try {
+          const createData = await api('POST', `/api/pages/${pageId}/floats`, { photoId: removedFloat.photoId });
+          const recreated = createData.page.floats[createData.page.floats.length - 1];
+          const putData = await api('PUT', `/api/pages/${pageId}/floats/${recreated.id}`, {
+            x: removedFloat.x, y: removedFloat.y, w: removedFloat.w, h: removedFloat.h,
+            crop: removedFloat.crop, shape: removedFloat.shape, mirrored: removedFloat.mirrored, rotation: removedFloat.rotation
+          });
+          const idx = appState.pages.findIndex((p) => p.id === pageId);
+          if (idx !== -1) appState.pages[idx] = putData.page;
+          flashSaved();
+        } catch (err) {
+          flashError(err.message);
+        }
+        renderEditorCanvas();
+      });
+    } catch (err) {
+      flashError(err.message);
+    }
+    renderEditorCanvas();
+  }
+
   async function assignSlot(pageId, slotIndex, body) {
+    // Every photo-replace in a slot (drag from library, drop from File
+    // Explorer, picker, URL import) funnels through here with a `photoId`
+    // in the body, so this is the one place to honor the "keep crop/shape
+    // when replacing" toolbar checkbox rather than threading it through
+    // every call site individually.
+    if (body.photoId !== undefined && $('#keepCropOnReplaceToggle').checked) {
+      body = { ...body, keepCrop: true };
+    }
+    // Same reasoning for one-level undo: assignSlot is the one chokepoint
+    // for every slot edit (crop/shape/mirror/rotate, hero, remove, photo
+    // replace), so snapshotting the slot here -- before the mutation --
+    // covers all of them without wiring undo into each call site.
+    const page = appState.pages.find((p) => p.id === pageId);
+    const prevSlot = page ? JSON.parse(JSON.stringify(page.slots[slotIndex])) : null;
     try {
       const data = await api('PUT', `/api/pages/${pageId}/slot/${slotIndex}`, body);
+      const pageIdx = appState.pages.findIndex((p) => p.id === pageId);
+      if (pageIdx !== -1) appState.pages[pageIdx] = data.page;
+      flashSaved();
+      if (prevSlot) {
+        recordUndo('slot edit', () => assignSlot(pageId, slotIndex, prevSlot.photoId
+          ? { photoId: prevSlot.photoId, hero: prevSlot.hero, crop: prevSlot.crop, shape: prevSlot.shape, mirrored: prevSlot.mirrored, rotation: prevSlot.rotation, keepCrop: true }
+          : { remove: true }));
+      }
+    } catch (err) {
+      flashError(err.message);
+    }
+    renderEditorCanvas();
+    renderPageRail();
+    renderEditorLibrary();
+  }
+
+  // Pulls a photo out of its slot and turns it into a loose floating photo
+  // instead -- the slot it leaves behind just goes back to "+ Add Photo"
+  // (the normal `remove` behavior), it is NOT backfilled with anything, so
+  // the rest of the layout doesn't shift around the way removing a photo
+  // from the middle of a list might suggest.
+  async function convertSlotToFloat(pageId, slotIndex, photoId, shape, mirrored, rotation, slotEl) {
+    try {
+      const stage = document.getElementById('pageStage');
+      const stageRect = stage ? stage.getBoundingClientRect() : null;
+      const slotRect = slotEl ? slotEl.getBoundingClientRect() : null;
+
+      const floatData = await api('POST', `/api/pages/${pageId}/floats`, { photoId });
+      let page = floatData.page;
+      const newFloat = page.floats[page.floats.length - 1];
+
+      if (newFloat && stageRect && slotRect && stageRect.width && stageRect.height) {
+        // Center the new float where the slot used to be instead of the
+        // usual staggered default corner, so the photo doesn't visually
+        // jump across the page -- same idea as re-centering a float
+        // dropped directly onto the stage (see importFileIntoFloat above).
+        const centerXFrac = (slotRect.left + slotRect.width / 2 - stageRect.left) / stageRect.width;
+        const centerYFrac = (slotRect.top + slotRect.height / 2 - stageRect.top) / stageRect.height;
+        const x = Math.min(1 - newFloat.w / 2, Math.max(-newFloat.w / 2, centerXFrac - newFloat.w / 2));
+        const y = Math.min(1 - newFloat.h / 2, Math.max(-newFloat.h / 2, centerYFrac - newFloat.h / 2));
+        const moveData = await api('PUT', `/api/pages/${pageId}/floats/${newFloat.id}`, { x, y });
+        page = moveData.page;
+      }
+
+      if (newFloat && (shape || mirrored || rotation)) {
+        const shapeData = await api('PUT', `/api/pages/${pageId}/floats/${newFloat.id}`, { shape, mirrored, rotation });
+        page = shapeData.page;
+      }
+
+      const slotData = await api('PUT', `/api/pages/${pageId}/slot/${slotIndex}`, { remove: true });
+      page = slotData.page;
+
+      const pageIdx = appState.pages.findIndex((p) => p.id === pageId);
+      if (pageIdx !== -1) appState.pages[pageIdx] = page;
+      flashSaved();
+    } catch (err) {
+      flashError(err.message);
+    }
+    renderEditorCanvas();
+    renderPageRail();
+  }
+
+  // The reverse of convertSlotToFloat above: puts a floating photo back
+  // into the first empty regular slot on the same page, then removes the
+  // float. There's no "which slot" to preserve (a float never came from a
+  // slot position in the first place, or if it did, that slot may be
+  // filled with something else by now), so this just claims whichever slot
+  // is free -- if none is, it says so rather than guessing which photo to
+  // displace.
+  async function convertFloatToSlot(pageId, floatId, photoId, shape, mirrored, rotation) {
+    const page = appState.pages.find((p) => p.id === pageId);
+    if (!page) return;
+    const emptyIndex = page.slots.findIndex((s) => !s.photoId);
+    if (emptyIndex === -1) {
+      flashError("No empty slot on this page to put the photo back into -- remove a photo from a slot, or add more slots, first.");
+      return;
+    }
+    try {
+      await api('PUT', `/api/pages/${pageId}/slot/${emptyIndex}`, { photoId, shape, mirrored, rotation });
+      const data = await api('DELETE', `/api/pages/${pageId}/floats/${floatId}`);
       const pageIdx = appState.pages.findIndex((p) => p.id === pageId);
       if (pageIdx !== -1) appState.pages[pageIdx] = data.page;
       flashSaved();
@@ -1687,7 +2329,6 @@
     }
     renderEditorCanvas();
     renderPageRail();
-    renderEditorLibrary();
   }
 
   // Rearranges two slots on the same page by swapping their entire contents
@@ -1971,18 +2612,38 @@
     rectEl.style.height = `${frac.h * h}px`;
   }
 
-  function initialCropStateFields(existingCrop) {
+  function initialCropStateFields(item) {
+    const existingCrop = item.crop;
     const mode = existingCrop && existingCrop.mode === 'free' ? 'free' : 'fill';
     return {
       mode,
       cx: 0.5, cy: 0.5, zoom: 1,
-      rect: mode === 'free' ? { x: existingCrop.x, y: existingCrop.y, w: existingCrop.w, h: existingCrop.h } : null
+      rect: mode === 'free' ? { x: existingCrop.x, y: existingCrop.y, w: existingCrop.w, h: existingCrop.h } : null,
+      shape: item.shape || null,
+      mirrored: !!item.mirrored,
+      rotation: item.rotation || 0
     };
   }
 
   function setCropModeUI(mode) {
     $('#cropModal').classList.toggle('free-mode', mode === 'free');
     $$('.crop-mode-toggle button').forEach((b) => b.classList.toggle('active', b.dataset.cropMode === mode));
+  }
+
+  // Syncs the shape swatches, mirror checkbox, and the floating/slot toggle
+  // button's label to the currently-open cropState -- called whenever the
+  // editor opens or one of those three changes.
+  function updateCropExtraUI() {
+    if (!cropState) return;
+    $$('.crop-shape-option').forEach((btn) => {
+      const val = btn.dataset.shape === 'none' ? null : btn.dataset.shape;
+      btn.classList.toggle('active', val === (cropState.shape || null));
+    });
+    $('#cropMirrorToggle').checked = !!cropState.mirrored;
+    $('#cropRotationLabel').textContent = `${cropState.rotation || 0}°`;
+    $('#cropFloatToggleBtn').textContent = cropState.floatId !== undefined
+      ? 'Put back into a regular slot'
+      : 'Make this a floating photo';
   }
 
   function openCropEditor(pageId, slotIndex) {
@@ -1993,8 +2654,9 @@
     const bounds = slotEl.getBoundingClientRect();
     const boxAR = bounds.width / bounds.height;
 
-    cropState = { pageId, slotIndex, boxAR, imgW: 0, imgH: 0, ...initialCropStateFields(slot.crop) };
+    cropState = { pageId, slotIndex, photoId: slot.photoId, boxAR, imgW: 0, imgH: 0, ...initialCropStateFields(slot) };
     setCropModeUI(cropState.mode);
+    updateCropExtraUI();
     startCropEditorFor(slot.photoId);
   }
 
@@ -2006,8 +2668,9 @@
     const bounds = floatEl.getBoundingClientRect();
     const boxAR = bounds.width / bounds.height;
 
-    cropState = { pageId, floatId, boxAR, imgW: 0, imgH: 0, ...initialCropStateFields(float.crop) };
+    cropState = { pageId, floatId, photoId: float.photoId, boxAR, imgW: 0, imgH: 0, ...initialCropStateFields(float) };
     setCropModeUI(cropState.mode);
+    updateCropExtraUI();
     startCropEditorFor(float.photoId);
   }
 
@@ -2112,6 +2775,47 @@
       updateCropRectVisual();
     });
 
+    $$('.crop-shape-option').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        if (!cropState) return;
+        cropState.shape = btn.dataset.shape === 'none' ? null : btn.dataset.shape;
+        updateCropExtraUI();
+      });
+    });
+
+    $('#cropMirrorToggle').addEventListener('change', (e) => {
+      if (!cropState) return;
+      cropState.mirrored = e.target.checked;
+    });
+
+    $('#cropRotateLeftBtn').addEventListener('click', () => {
+      if (!cropState) return;
+      cropState.rotation = (cropState.rotation + 270) % 360;
+      updateCropExtraUI();
+    });
+    $('#cropRotateRightBtn').addEventListener('click', () => {
+      if (!cropState) return;
+      cropState.rotation = (cropState.rotation + 90) % 360;
+      updateCropExtraUI();
+    });
+
+    // Converting to/from a floating photo changes what the photo *is*, not
+    // just an attribute of it, so unlike shape/mirror/crop/rotation it
+    // applies right away instead of waiting for Done -- and closes the
+    // editor afterward, since the slot/float this editor was opened for no
+    // longer holds this photo.
+    $('#cropFloatToggleBtn').addEventListener('click', async () => {
+      if (!cropState) return;
+      const { pageId, slotIndex, floatId, photoId, shape, mirrored, rotation } = cropState;
+      closeCropEditor();
+      if (floatId !== undefined) {
+        await convertFloatToSlot(pageId, floatId, photoId, shape, mirrored, rotation);
+      } else {
+        const slotEl = document.querySelector(`#pageStage .slot[data-slot-index="${slotIndex}"]`);
+        await convertSlotToFloat(pageId, slotIndex, photoId, shape, mirrored, rotation, slotEl);
+      }
+    });
+
     $('#cropCancelBtn').addEventListener('click', closeCropEditor);
     $('#cropClose').addEventListener('click', closeCropEditor);
     $('#cropModal').addEventListener('click', (e) => {
@@ -2120,19 +2824,31 @@
     $('#cropDoneBtn').addEventListener('click', async () => {
       if (!cropState) return;
       const crop = currentCropRectFraction();
-      const { pageId, slotIndex, floatId } = cropState;
+      const { pageId, slotIndex, floatId, shape, mirrored, rotation } = cropState;
       if (floatId !== undefined) {
+        const page = appState.pages.find((p) => p.id === pageId);
+        const prevFloat = page ? JSON.parse(JSON.stringify(page.floats.find((f) => f.id === floatId))) : null;
         try {
-          const data = await api('PUT', `/api/pages/${pageId}/floats/${floatId}`, { crop });
+          const data = await api('PUT', `/api/pages/${pageId}/floats/${floatId}`, { crop, shape, mirrored, rotation });
           const pageIdx = appState.pages.findIndex((p) => p.id === pageId);
           if (pageIdx !== -1) appState.pages[pageIdx] = data.page;
           flashSaved();
+          if (prevFloat) {
+            recordUndo('float edit', () => api('PUT', `/api/pages/${pageId}/floats/${floatId}`, {
+              crop: prevFloat.crop, shape: prevFloat.shape, mirrored: prevFloat.mirrored, rotation: prevFloat.rotation
+            }).then((d) => {
+              const idx = appState.pages.findIndex((p) => p.id === pageId);
+              if (idx !== -1) appState.pages[idx] = d.page;
+              flashSaved();
+              renderEditorCanvas();
+            }).catch((err) => flashError(err.message)));
+          }
         } catch (err) {
           flashError(err.message);
         }
         renderEditorCanvas();
       } else {
-        await assignSlot(pageId, slotIndex, { crop });
+        await assignSlot(pageId, slotIndex, { crop, shape, mirrored, rotation });
       }
       closeCropEditor();
     });
@@ -2244,6 +2960,8 @@
     initExportTab();
     initOneDriveModal();
     initProjectChooser();
+    initResizablePanels();
+    initKeyboardShortcuts();
 
     try {
       appState = await api('GET', '/api/state');
@@ -2400,6 +3118,75 @@
         }
       });
     });
+  }
+
+  // A draggable handle on one edge of a layout panel (the overall app
+  // content area, the Editor tab's library sidebar, ...), letting the user
+  // resize that panel by hand instead of living with a fixed CSS size.
+  // Distinct from the photo resize handles above: those resize a photo's
+  // box within a page; this resizes the app's own UI chrome, and remembers
+  // the chosen size in this browser (localStorage) so it's not lost on
+  // reload -- it's a per-install display preference, not album data, so it
+  // has no business in data/state.json on the server.
+  function makeResizablePanel(el, { edge, cssProp, axis, min, max, storageKey }) {
+    const handle = document.createElement('div');
+    handle.className = `panel-resize-handle ${edge === 'right' || edge === 'left' ? 'vertical' : 'horizontal'}`;
+    handle.title = 'Drag to resize';
+    if (edge === 'left') handle.style.left = '-7px';
+    if (edge === 'top') handle.style.top = '-7px';
+    el.appendChild(handle);
+
+    try {
+      const stored = parseFloat(localStorage.getItem(storageKey));
+      if (!isNaN(stored)) el.style[cssProp] = `${Math.min(max, Math.max(min, stored))}px`;
+    } catch (err) {
+      // localStorage can throw in a private window or with site data
+      // blocked -- the panel just keeps its default CSS size.
+    }
+
+    handle.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      handle.classList.add('active');
+      const startSize = el.getBoundingClientRect()[axis === 'x' ? 'width' : 'height'];
+      const startPos = axis === 'x' ? e.clientX : e.clientY;
+      const sign = (edge === 'left' || edge === 'top') ? -1 : 1;
+
+      const onMove = (moveEvent) => {
+        const pos = axis === 'x' ? moveEvent.clientX : moveEvent.clientY;
+        const next = Math.min(max, Math.max(min, startSize + sign * (pos - startPos)));
+        el.style[cssProp] = `${next}px`;
+      };
+      const onUp = () => {
+        window.removeEventListener('mousemove', onMove);
+        window.removeEventListener('mouseup', onUp);
+        handle.classList.remove('active');
+        try {
+          localStorage.setItem(storageKey, el.style[cssProp].replace('px', ''));
+        } catch (err) {
+          // Nothing to fall back to here -- the size just won't persist.
+        }
+      };
+      window.addEventListener('mousemove', onMove);
+      window.addEventListener('mouseup', onUp);
+    });
+  }
+
+  function initResizablePanels() {
+    const main = document.getElementById('appMain');
+    if (main) {
+      makeResizablePanel(main, {
+        edge: 'right', cssProp: 'maxWidth', axis: 'x', min: 700, max: 2400,
+        storageKey: 'wav-resize-main-width'
+      });
+    }
+    const library = document.querySelector('.editor-library');
+    if (library) {
+      makeResizablePanel(library, {
+        edge: 'right', cssProp: 'width', axis: 'x', min: 180, max: 560,
+        storageKey: 'wav-resize-library-width'
+      });
+    }
   }
 
   function initProjectChooser() {

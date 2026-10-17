@@ -85,6 +85,15 @@ for (const project of appData.projects) {
     if (!page.floats) page.floats = [];
     for (const float of page.floats) {
       if (float.crop === undefined) float.crop = null;
+      if (float.shape === undefined) float.shape = null;
+      if (float.mirrored === undefined) float.mirrored = false;
+      if (float.rotation === undefined) float.rotation = 0;
+    }
+    for (const slot of page.slots) {
+      if (slot.shape === undefined) slot.shape = null;
+      if (slot.rect === undefined) slot.rect = null;
+      if (slot.mirrored === undefined) slot.mirrored = false;
+      if (slot.rotation === undefined) slot.rotation = 0;
     }
   }
 
@@ -726,6 +735,15 @@ app.post('/api/history/:id/restore', (req, res) => {
         if (!page.floats) page.floats = [];
         for (const float of page.floats) {
           if (float.crop === undefined) float.crop = null;
+          if (float.shape === undefined) float.shape = null;
+          if (float.mirrored === undefined) float.mirrored = false;
+          if (float.rotation === undefined) float.rotation = 0;
+        }
+        for (const slot of page.slots) {
+          if (slot.shape === undefined) slot.shape = null;
+          if (slot.rect === undefined) slot.rect = null;
+          if (slot.mirrored === undefined) slot.mirrored = false;
+          if (slot.rotation === undefined) slot.rotation = 0;
         }
       }
     }
@@ -879,8 +897,42 @@ app.put('/api/pages/:pageId/layout', (req, res) => {
   const page = state.pages.find((p) => p.id === req.params.pageId);
   if (!page) return res.status(404).json({ ok: false, error: 'Page not found' });
   page.slots = resizeSlotsForLayout(page.slots, layout);
+  // Picking a layout (even re-picking the current one) is a deliberate
+  // "start over" action, so any free-form slot sizing from the resize
+  // handles is cleared and the page goes back to the template's own grid.
+  page.slots.forEach((slot) => { slot.rect = null; });
   page.layout = layout;
   page.splits = defaultSplitsForLayout(layout);
+  persist();
+  res.json({ ok: true, page });
+});
+
+// Batch-sets every slot's free-form rect (fractions of the page's content
+// box, same frame of reference as layoutRects() in pdfExporter.js) in one
+// call -- used both to seed the current template's computed positions the
+// first time a slot is resized, and to persist the result of a resize drag
+// (which may also have shrunk neighboring slots to avoid overlap). A null
+// entry clears that slot back to no custom rect.
+app.put('/api/pages/:pageId/slots/rects', (req, res) => {
+  const state = activeProject();
+  const page = state.pages.find((p) => p.id === req.params.pageId);
+  if (!page) return res.status(404).json({ ok: false, error: 'Page not found' });
+  const { rects } = req.body;
+  if (!Array.isArray(rects) || rects.length !== page.slots.length) {
+    return res.status(400).json({ ok: false, error: "Rects must match the page's slot count." });
+  }
+  page.slots.forEach((slot, i) => {
+    const r = rects[i];
+    if (!r) { slot.rect = null; return; }
+    const w = Math.min(1, Math.max(0.03, parseFloat(r.w)));
+    const h = Math.min(1, Math.max(0.03, parseFloat(r.h)));
+    slot.rect = {
+      x: Math.min(1 - w, Math.max(0, parseFloat(r.x))),
+      y: Math.min(1 - h, Math.max(0, parseFloat(r.y))),
+      w,
+      h
+    };
+  });
   persist();
   res.json({ ok: true, page });
 });
@@ -916,6 +968,15 @@ const FLOAT_START_POSITIONS = [
   { x: 0.08, y: 0.08 }
 ];
 
+// Only 0/90/180/270 are meaningful rotations for a photo (anything else
+// would require re-cropping math this app doesn't support), so any other
+// value -- including a non-multiple-of-90 -- just falls back to no rotation
+// rather than being rejected outright.
+function normalizeRotation(v) {
+  const n = ((parseInt(v, 10) % 360) + 360) % 360;
+  return [0, 90, 180, 270].includes(n) ? n : 0;
+}
+
 app.post('/api/pages/:pageId/floats', async (req, res) => {
   const state = activeProject();
   const page = state.pages.find((p) => p.id === req.params.pageId);
@@ -935,7 +996,10 @@ app.post('/api/pages/:pageId/floats', async (req, res) => {
       y: pos.y,
       w,
       h,
-      crop: null
+      crop: null,
+      shape: null,
+      mirrored: false,
+      rotation: 0
     };
     page.floats.push(float);
     persist();
@@ -952,16 +1016,18 @@ app.put('/api/pages/:pageId/floats/:floatId', (req, res) => {
   const float = page.floats.find((f) => f.id === req.params.floatId);
   if (!float) return res.status(404).json({ ok: false, error: 'Floating photo not found' });
   const clampSize = (v) => Math.min(1, Math.max(0.03, v));
-  const { x, y, w, h, crop, photoId } = req.body;
+  const { x, y, w, h, crop, photoId, shape, mirrored, rotation, keepCrop } = req.body;
   // Replacing which photo a float shows (e.g. by dropping a new one onto
   // it) keeps its position/size exactly where they were -- only the
-  // content changes -- and clears any crop, which was framed for the old
-  // photo and likely wouldn't make sense on the new one.
+  // content changes -- and by default clears any crop, which was framed
+  // for the old photo and likely wouldn't make sense on the new one;
+  // `keepCrop` opts out of that, for e.g. swapping in another shot from the
+  // same burst where the old framing still applies.
   if (photoId !== undefined) {
     const photo = state.photos.find((p) => p.id === photoId);
     if (!photo) return res.status(404).json({ ok: false, error: 'Photo not found' });
     float.photoId = photoId;
-    float.crop = null;
+    if (!keepCrop) float.crop = null;
   }
   // A float may hang partway off the page edge (a common scrapbook look),
   // so position is clamped relative to its own half-width/height, not to
@@ -972,6 +1038,9 @@ app.put('/api/pages/:pageId/floats/:floatId', (req, res) => {
   if (x !== undefined) float.x = Math.min(1 - float.w / 2, Math.max(-float.w / 2, parseFloat(x)));
   if (y !== undefined) float.y = Math.min(1 - float.h / 2, Math.max(-float.h / 2, parseFloat(y)));
   if (crop !== undefined) float.crop = crop;
+  if (shape !== undefined) float.shape = shape || null;
+  if (mirrored !== undefined) float.mirrored = !!mirrored;
+  if (rotation !== undefined) float.rotation = normalizeRotation(rotation);
   persist();
   res.json({ ok: true, page });
 });
@@ -993,16 +1062,23 @@ app.put('/api/pages/:pageId/slot/:slotIndex', (req, res) => {
   if (idx < 0 || idx >= page.slots.length) {
     return res.status(400).json({ ok: false, error: 'Invalid slot index' });
   }
-  const { photoId, remove, hero, crop } = req.body;
+  const { photoId, remove, hero, crop, shape, mirrored, rotation, keepCrop } = req.body;
   if (remove) {
-    page.slots[idx] = { photoId: null, hero: false, crop: null };
+    page.slots[idx] = { photoId: null, hero: false, crop: null, shape: null, mirrored: false, rotation: 0 };
   } else {
     if (photoId !== undefined) {
       page.slots[idx].photoId = photoId;
-      page.slots[idx].crop = null; // a new photo starts with no crop applied
+      // By default a new photo starts with no crop applied, since one
+      // framed for the old photo likely wouldn't make sense on the new
+      // one -- `keepCrop` opts out, for e.g. swapping in another shot from
+      // the same burst where the old framing still applies.
+      if (!keepCrop) page.slots[idx].crop = null;
     }
     if (hero !== undefined) page.slots[idx].hero = !!hero;
     if (crop !== undefined) page.slots[idx].crop = crop;
+    if (shape !== undefined) page.slots[idx].shape = shape || null;
+    if (mirrored !== undefined) page.slots[idx].mirrored = !!mirrored;
+    if (rotation !== undefined) page.slots[idx].rotation = normalizeRotation(rotation);
   }
   persist();
   res.json({ ok: true, page });
@@ -1023,6 +1099,45 @@ app.post('/api/pages/:pageId/slots/swap', (req, res) => {
   const tmp = page.slots[idxA];
   page.slots[idxA] = page.slots[idxB];
   page.slots[idxB] = tmp;
+  persist();
+  res.json({ ok: true, page });
+});
+
+// Deep-clones a page (layout, splits, every slot's photo/crop/shape/
+// mirrored/rotation, and every floating photo) and inserts the copy right
+// after the original -- floats get freshly generated ids so they're never
+// confused with the originals'.
+app.post('/api/pages/:pageId/duplicate', (req, res) => {
+  const state = activeProject();
+  const idx = state.pages.findIndex((p) => p.id === req.params.pageId);
+  if (idx === -1) return res.status(404).json({ ok: false, error: 'Page not found' });
+  const clone = JSON.parse(JSON.stringify(state.pages[idx]));
+  clone.id = nextPageId(state.pages);
+  clone.floats = (clone.floats || []).map((f) => ({
+    ...f,
+    id: `float-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`
+  }));
+  state.pages.splice(idx + 1, 0, clone);
+  persist();
+  res.json({ ok: true, pages: state.pages, newPageId: clone.id });
+});
+
+// Applies one shape and/or mirrored setting to every filled slot and
+// floating photo on a page in a single call, for "make this whole page
+// consistent" instead of clicking through each photo individually. Empty
+// slots are skipped since there's no photo to style.
+app.put('/api/pages/:pageId/bulk-style', (req, res) => {
+  const state = activeProject();
+  const page = state.pages.find((p) => p.id === req.params.pageId);
+  if (!page) return res.status(404).json({ ok: false, error: 'Page not found' });
+  const { shape, mirrored } = req.body;
+  const applyTo = (item) => {
+    if (!item.photoId) return;
+    if (shape !== undefined) item.shape = shape || null;
+    if (mirrored !== undefined) item.mirrored = !!mirrored;
+  };
+  page.slots.forEach(applyTo);
+  (page.floats || []).forEach(applyTo);
   persist();
   res.json({ ok: true, page });
 });

@@ -115,7 +115,7 @@ function defaultSplitsForLayout(layout) {
 
 function makeEmptySlots(layout) {
   const count = LAYOUT_SLOT_COUNT[layout] || 1;
-  return Array.from({ length: count }, () => ({ photoId: null, hero: false, crop: null }));
+  return Array.from({ length: count }, () => ({ photoId: null, hero: false, crop: null, shape: null, rect: null, mirrored: false, rotation: 0 }));
 }
 
 function makePage(id, layout = 1) {
