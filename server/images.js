@@ -70,4 +70,53 @@ async function getCroppedBuffer(absPath, crop, maxWidth) {
     .toBuffer();
 }
 
-module.exports = { getCachedImage, getResizedBuffer, getImageMeta, getCroppedBuffer, getDisplayDimensions };
+// A "difference hash": shrink to 9x8 grayscale, then for each row compare
+// each pixel to the one right of it -- 8 comparisons per row x 8 rows = 64
+// bits, returned as a hex string. Two photos that look visually similar
+// (crops, re-exports, near-identical burst shots) end up with hashes that
+// differ in only a few bits, even though their files are completely
+// different on disk -- unlike the filename/timestamp burst-grouping
+// heuristic this app already does elsewhere, this looks at actual pixel
+// content.
+async function getPerceptualHash(absPath) {
+  const { data } = await sharp(absPath, { failOn: 'none' })
+    .rotate()
+    .resize(9, 8, { fit: 'fill' })
+    .grayscale()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  let bits = '';
+  for (let row = 0; row < 8; row++) {
+    for (let col = 0; col < 8; col++) {
+      const left = data[row * 9 + col];
+      const right = data[row * 9 + col + 1];
+      bits += left < right ? '1' : '0';
+    }
+  }
+  // Store as hex (16 chars for 64 bits) -- compact and easy to diff.
+  let hex = '';
+  for (let i = 0; i < 64; i += 4) {
+    hex += parseInt(bits.slice(i, i + 4), 2).toString(16);
+  }
+  return hex;
+}
+
+// Hamming distance between two same-length hex hashes from the function
+// above -- the number of differing bits, so 0 means visually identical (as
+// far as this coarse a fingerprint can tell) and higher means less alike.
+function hashDistance(hexA, hexB) {
+  let distance = 0;
+  for (let i = 0; i < hexA.length; i++) {
+    let x = parseInt(hexA[i], 16) ^ parseInt(hexB[i], 16);
+    while (x) {
+      distance += x & 1;
+      x >>= 1;
+    }
+  }
+  return distance;
+}
+
+module.exports = {
+  getCachedImage, getResizedBuffer, getImageMeta, getCroppedBuffer, getDisplayDimensions,
+  getPerceptualHash, hashDistance
+};

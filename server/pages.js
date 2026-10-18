@@ -115,11 +115,14 @@ function defaultSplitsForLayout(layout) {
 
 function makeEmptySlots(layout) {
   const count = LAYOUT_SLOT_COUNT[layout] || 1;
-  return Array.from({ length: count }, () => ({ photoId: null, hero: false, crop: null, shape: null, rect: null, mirrored: false, rotation: 0 }));
+  return Array.from({ length: count }, () => ({ photoId: null, hero: false, crop: null, shape: null, rect: null, mirrored: false, rotation: 0, filter: null }));
 }
 
 function makePage(id, layout = 1) {
-  return { id, layout, slots: makeEmptySlots(layout), splits: defaultSplitsForLayout(layout), floats: [] };
+  return {
+    id, layout, slots: makeEmptySlots(layout), splits: defaultSplitsForLayout(layout), floats: [],
+    isCover: false, coverTitle: '', coverSubtitle: '', coverDate: ''
+  };
 }
 
 // Resize a page's slots array when its layout changes, keeping photos

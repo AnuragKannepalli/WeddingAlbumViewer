@@ -1,13 +1,16 @@
 (() => {
   'use strict';
 
-  let appState = { sourceFolder: null, photos: [], pages: [] };
+  let appState = { sourceFolder: null, photos: [], removedPhotos: [], pageStylePresets: [], pages: [] };
   let currentPageIndex = 0;
   let pickerTarget = null; // { pageId, slotIndex }
   let slotFileTarget = null; // { pageId, slotIndex }
   let slotDragSource = null; // { pageId, slotIndex } -- set while dragging a filled slot to rearrange it; cleared on dragend AND the instant any drop reads it (see the slot drop handler)
   let lastEditUndo = null; // { label, run } -- the one most recent undoable edit, see recordUndo()
   let hoveredPhoto = null; // { type: 'slot', pageId, slotIndex } | { type: 'float', pageId, float } -- for the Delete key shortcut
+  let visualDuplicateIds = new Set(); // photo ids flagged by the last "Scan for Duplicates" run (see images.js's perceptual hash)
+  let newPresetShape = null; // staged shape/filter for the "New preset" form in the Style Presets modal -- not applied until Save
+  let newPresetFilter = null;
 
   // Named sheet-size shortcuts shown in the preset dropdown. Keys must
   // match the <option value="..."> in index.html; anything not matching
@@ -45,6 +48,12 @@
     if (!res.ok || data.ok === false) {
       throw new Error(data.error || `Request failed: ${url}`);
     }
+    // Several routes can move a photo into or out of the Removed tray as a
+    // side effect (clearing a slot/float that held it, or reviving one
+    // dragged back in) and echo both arrays back when they do -- mirror
+    // them into appState here, in one place, instead of at every call site.
+    if (data.photos) appState.photos = data.photos;
+    if (data.removedPhotos) appState.removedPhotos = data.removedPhotos;
     return data;
   }
 
@@ -268,6 +277,17 @@
     return new Set(photoUsageMap().keys());
   }
 
+  // True for any photo this album still knows about -- in the active
+  // library OR sitting in the Removed tray -- as opposed to a genuinely
+  // external file. Drop handlers check this before dataTransfer.files,
+  // since some browsers populate files with a synthetic image for an
+  // in-page <img> drag too (including dragging a tray card), not just a
+  // real drop from outside the browser.
+  function isAppPhotoId(id) {
+    if (!id) return false;
+    return appState.photos.some((p) => p.id === id) || (appState.removedPhotos || []).some((p) => p.id === id);
+  }
+
   // Jumps to the next place (after this one, wrapping around) the same
   // photo is used -- repeated clicks cycle through every occurrence, not
   // just back and forth between two.
@@ -282,12 +302,13 @@
     jumpToPage(next.pageIndex + 1);
   }
 
-  function filterPhotos(photos, { search, favOnly, unusedOnly }) {
+  function filterPhotos(photos, { search, favOnly, unusedOnly, visualDupOnly }) {
     const used = unusedOnly ? usedPhotoIds() : null;
     return photos.filter((p) => {
       if (search && !p.filename.toLowerCase().includes(search.toLowerCase())) return false;
       if (favOnly && !p.favorite) return false;
       if (unusedOnly && used.has(p.id)) return false;
+      if (visualDupOnly && !visualDuplicateIds.has(p.id)) return false;
       return true;
     });
   }
@@ -298,8 +319,9 @@
         ${selectable ? `<label class="select-check-overlay"><input type="checkbox" data-action="select" ${selected ? 'checked' : ''} /></label>` : ''}
         <img src="/api/thumb/${photo.id}" alt="${escapeHtml(photo.filename)}" loading="lazy" />
         <button class="fav-star" title="Toggle favorite" data-action="fav">&#9733;</button>
-        ${photo.possibleDuplicate ? '<span class="dup-badge" title="Possible burst/duplicate">dup?</span>' : ''}
+        ${photo.possibleDuplicate ? '<span class="dup-badge" title="Possible burst/duplicate (guessed from filename and timing)">dup?</span>' : ''}
         ${usageCount > 1 ? `<span class="placed-badge" title="Already placed ${usageCount} times in the album">Used &times;${usageCount}</span>` : ''}
+        ${visualDuplicateIds.has(photo.id) ? '<span class="visual-dup-badge" title="Looks visually similar to another photo (from the last duplicate scan)">Similar</span>' : ''}
         <span class="filename-label">${escapeHtml(photo.filename)}</span>
       </div>`;
   }
@@ -376,8 +398,10 @@
   function renderLibraryTab() {
     const search = $('#librarySearch').value;
     const favOnly = $('#favOnlyToggle').checked;
-    const filtered = filterPhotos(appState.photos, { search, favOnly });
+    const visualDupOnly = $('#visualDupOnlyToggle').checked;
+    const filtered = filterPhotos(appState.photos, { search, favOnly, visualDupOnly });
     $('#libraryCount').textContent = `${filtered.length} of ${appState.photos.length} photos`;
+    $('#libraryPlacedCount').textContent = `${usedPhotoIds().size} placed in album`;
     // Drop selected ids that are no longer in view (filtered out, or the
     // photo itself is gone), so bulk actions never act on something unseen.
     const visibleIds = new Set(filtered.map((p) => p.id));
@@ -433,9 +457,36 @@
     renderEditorTab();
   }
 
+  // Compares every photo's actual visual content (a perceptual hash, see
+  // images.js) to find near-identical shots -- distinct from the existing
+  // weak dup-badge, which only guesses from filename/timing. An explicit
+  // button rather than automatic, since hashing the whole library takes a
+  // moment for a large one.
+  async function scanForDuplicates() {
+    setStatus('#scanDuplicatesStatus', 'Scanning photos for visual duplicates...', false);
+    try {
+      const data = await api('GET', '/api/photos/duplicate-groups');
+      visualDuplicateIds = new Set(data.groups.flat());
+      const groupCount = data.groups.length;
+      setStatus(
+        '#scanDuplicatesStatus',
+        groupCount > 0
+          ? `Found ${visualDuplicateIds.size} photo(s) in ${groupCount} group(s) of likely duplicates.`
+          : 'No likely duplicates found.',
+        false, true
+      );
+    } catch (err) {
+      setStatus('#scanDuplicatesStatus', err.message, true);
+      return;
+    }
+    renderLibraryTab();
+  }
+
   function initLibraryTab() {
     $('#librarySearch').addEventListener('input', renderLibraryTab);
     $('#favOnlyToggle').addEventListener('change', renderLibraryTab);
+    $('#visualDupOnlyToggle').addEventListener('change', renderLibraryTab);
+    $('#scanDuplicatesBtn').addEventListener('click', () => scanForDuplicates());
     $('#selFavBtn').addEventListener('click', () => bulkSetFavorite(true));
     $('#selUnfavBtn').addEventListener('click', () => bulkSetFavorite(false));
     $('#selDeleteBtn').addEventListener('click', bulkDeletePhotos);
@@ -451,6 +502,8 @@
     $('#editorSearch').addEventListener('input', renderEditorLibrary);
     $('#editorFavOnly').addEventListener('change', renderEditorLibrary);
     $('#editorUnusedOnly').addEventListener('change', renderEditorLibrary);
+    $('#removedTrayDeleteAllBtn').addEventListener('click', () => deleteAllRemovedPhotos());
+    $('#sweepUnusedBtn').addEventListener('click', () => sweepUnusedPhotos());
 
     $('#pageCountInput').addEventListener('change', async (e) => {
       const count = Math.max(0, parseInt(e.target.value, 10) || 0);
@@ -480,6 +533,12 @@
       const page = appState.pages[currentPageIndex];
       if (page) deletePage(page.id);
     });
+    $('#pageExportBtn').addEventListener('click', () => {
+      const page = appState.pages[currentPageIndex];
+      if (!page) return;
+      const format = $('#pageExportFormat').value;
+      window.location = `/api/pages/${page.id}/export?format=${format}`;
+    });
 
     $$('#pageShapeOptions .crop-shape-option').forEach((btn) => {
       btn.addEventListener('click', () => {
@@ -488,6 +547,22 @@
       });
     });
     $('#pageMirrorAllBtn').addEventListener('click', () => applyPageStyle({ mirrored: true }));
+    $('#pageFilterAllBtn').addEventListener('click', () => {
+      const val = $('#pageFilterAllSelect').value;
+      applyPageStyle({ filter: val === 'none' ? null : val });
+    });
+    $('#pageAutoComposeBtn').addEventListener('click', () => autoComposePage());
+    $('#pageStylePresetsBtn').addEventListener('click', () => openStylePresetsModal());
+    $('#spreadViewToggle').addEventListener('change', () => updateSpreadPreview());
+    $('#spreadViewRefreshBtn').addEventListener('click', () => updateSpreadPreview());
+
+    $('#coverPageToggle').addEventListener('change', (e) => saveCoverSettings({ isCover: e.target.checked }));
+    $('#coverTitleInput').addEventListener('blur', (e) => saveCoverSettings({ coverTitle: e.target.value }));
+    $('#coverSubtitleInput').addEventListener('blur', (e) => saveCoverSettings({ coverSubtitle: e.target.value }));
+    $('#coverDateInput').addEventListener('blur', (e) => saveCoverSettings({ coverDate: e.target.value }));
+    $$('#coverTitleInput, #coverSubtitleInput, #coverDateInput').forEach((input) => {
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') input.blur(); });
+    });
 
     $('#jumpToPageInput').addEventListener('keydown', (e) => {
       if (e.key !== 'Enter') return;
@@ -503,18 +578,22 @@
       openPicker(page.id, null, true);
     });
 
+    $('#fillEmptySlotsBtn').addEventListener('click', () => fillEmptySlots());
+
     wirePageStageFloatDrop();
 
     $('#pageSizePreset').addEventListener('change', async (e) => {
       const preset = PAGE_SIZE_PRESETS[e.target.value];
       if (preset) {
-        $('#pageSizeCustomInputs').hidden = true;
         await applyPageSize(preset.widthIn, preset.heightIn);
       } else {
-        $('#pageSizeCustomInputs').hidden = false;
-        $('#pageSizeWidth').value = appState.pageSize.widthIn;
-        $('#pageSizeHeight').value = appState.pageSize.heightIn;
+        openPageSizeModal();
       }
+    });
+    $('#pageSizeModalClose').addEventListener('click', closePageSizeModal);
+    $('#pageSizeCancelBtn').addEventListener('click', closePageSizeModal);
+    $('#pageSizeModal').addEventListener('click', (e) => {
+      if (e.target === $('#pageSizeModal')) closePageSizeModal();
     });
     $('#pageSizeApplyBtn').addEventListener('click', async () => {
       const widthIn = parseFloat($('#pageSizeWidth').value);
@@ -524,6 +603,7 @@
         return;
       }
       await applyPageSize(widthIn, heightIn);
+      $('#pageSizeModal').classList.remove('active');
     });
 
     $('#layoutGapToggle').addEventListener('change', async (e) => {
@@ -654,14 +734,218 @@
     renderEditorCanvas();
   }
 
+  // Fills every empty slot across every page, in order, with your next
+  // favorited-and-unused photo -- a quick way to rough in a big album from
+  // your favorites instead of dragging each one individually. Never
+  // touches a filled slot or reaches for a non-favorited photo.
+  async function fillEmptySlots() {
+    let data;
+    try {
+      data = await api('POST', '/api/pages/fill-empty-slots', {});
+      appState.pages = data.pages;
+      flashSaved();
+    } catch (err) {
+      flashError(err.message);
+      return;
+    }
+    const el = $('#saveIndicator');
+    if (data.filledCount === 0) {
+      el.textContent = 'No empty slots filled -- mark some photos as favorites first, or there are no empty slots.';
+    } else {
+      el.textContent = `Filled ${data.filledCount} slot(s)` +
+        (data.favoritesRemaining > 0 ? ` -- ${data.favoritesRemaining} favorite(s) left unplaced (no empty slots for them).` : '.');
+    }
+    el.style.color = '#3b7a3b';
+    clearTimeout(flashSaved._t);
+    flashSaved._t = setTimeout(() => { el.textContent = ''; }, 4000);
+    renderEditorCanvas();
+    renderPageRail();
+    renderEditorLibrary();
+  }
+
+  // ---- Page style presets ----
+  // A named {shape, mirrored, filter} bundle, defined explicitly in its own
+  // small form (not captured from a page's current state, since different
+  // slots on the same page can already carry different styles -- there'd
+  // be no single "current style" to capture). Applying one just calls the
+  // same bulk-style route the Shape/Mirror All buttons already use.
+
+  function openStylePresetsModal() {
+    newPresetShape = null;
+    newPresetFilter = null;
+    $('#newPresetName').value = '';
+    $$('#newPresetShapeOptions .crop-shape-option').forEach((b) => b.classList.toggle('active', b.dataset.shape === 'none'));
+    $$('#newPresetFilterOptions .crop-filter-option').forEach((b) => b.classList.toggle('active', b.dataset.filter === 'none'));
+    $('#newPresetMirrored').checked = false;
+    renderStylePresetsList();
+    $('#stylePresetsModal').classList.add('active');
+  }
+
+  function closeStylePresetsModal() {
+    $('#stylePresetsModal').classList.remove('active');
+  }
+
+  function renderStylePresetsList() {
+    const presets = appState.pageStylePresets || [];
+    $('#stylePresetsList').innerHTML = presets.map((p) => `
+      <div class="style-preset-row" data-id="${p.id}">
+        <span class="style-preset-name">${escapeHtml(p.name)}</span>
+        <button data-action="apply">Apply to Page</button>
+        <button data-action="delete" class="danger">Delete</button>
+      </div>`).join('');
+    $$('#stylePresetsList .style-preset-row').forEach((row) => {
+      const id = row.dataset.id;
+      const preset = presets.find((p) => p.id === id);
+      row.querySelector('[data-action="apply"]').addEventListener('click', async () => {
+        await applyPageStyle({ shape: preset.shape, mirrored: preset.mirrored, filter: preset.filter });
+        closeStylePresetsModal();
+      });
+      row.querySelector('[data-action="delete"]').addEventListener('click', async () => {
+        try {
+          const data = await api('DELETE', `/api/style-presets/${id}`);
+          appState.pageStylePresets = data.pageStylePresets;
+          flashSaved();
+        } catch (err) {
+          flashError(err.message);
+          return;
+        }
+        renderStylePresetsList();
+      });
+    });
+  }
+
+  function initStylePresetsModal() {
+    $('#stylePresetsModalClose').addEventListener('click', closeStylePresetsModal);
+    $('#stylePresetsModal').addEventListener('click', (e) => {
+      if (e.target === $('#stylePresetsModal')) closeStylePresetsModal();
+    });
+    $$('#newPresetShapeOptions .crop-shape-option').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        newPresetShape = btn.dataset.shape === 'none' ? null : btn.dataset.shape;
+        $$('#newPresetShapeOptions .crop-shape-option').forEach((b) => b.classList.toggle('active', b === btn));
+      });
+    });
+    $$('#newPresetFilterOptions .crop-filter-option').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        newPresetFilter = btn.dataset.filter === 'none' ? null : btn.dataset.filter;
+        $$('#newPresetFilterOptions .crop-filter-option').forEach((b) => b.classList.toggle('active', b === btn));
+      });
+    });
+    $('#savePresetBtn').addEventListener('click', async () => {
+      const name = $('#newPresetName').value.trim();
+      if (!name) {
+        flashError('Enter a name for this preset.');
+        return;
+      }
+      try {
+        const data = await api('POST', '/api/style-presets', {
+          name, shape: newPresetShape, mirrored: $('#newPresetMirrored').checked, filter: newPresetFilter
+        });
+        appState.pageStylePresets = data.pageStylePresets;
+        flashSaved();
+      } catch (err) {
+        flashError(err.message);
+        return;
+      }
+      $('#newPresetName').value = '';
+      renderStylePresetsList();
+    });
+  }
+
+  // Updates a page's cover/title-page flag and/or overlay text (title,
+  // subtitle, date) -- the same page underneath, just with that overlay
+  // drawn on top of it at export time. See the cover route's comment in
+  // server/index.js for why this is its own small route rather than
+  // folded into bulk-style, which only ever touches individual photos.
+  async function saveCoverSettings(body) {
+    const page = appState.pages[currentPageIndex];
+    if (!page) return;
+    try {
+      const data = await api('PUT', `/api/pages/${page.id}/cover`, body);
+      const pageIdx = appState.pages.findIndex((p) => p.id === page.id);
+      if (pageIdx !== -1) appState.pages[pageIdx] = data.page;
+      flashSaved();
+    } catch (err) {
+      flashError(err.message);
+    }
+    renderEditorCanvas();
+    renderPageRail();
+  }
+
+  // Heuristic "auto-compose": asks the server to make a light, automatic
+  // editorial pass over the current page's photos (see the comment on the
+  // auto-compose route for exactly what it does) and swaps the whole page in
+  // afterward. Recorded as a one-level undo via the whole-page `replace`
+  // route rather than the usual per-slot one, since this can touch several
+  // slots and add a float in one go.
+  async function autoComposePage() {
+    const page = appState.pages[currentPageIndex];
+    if (!page) return;
+    try {
+      const data = await api('POST', `/api/pages/${page.id}/auto-compose`, {});
+      const pageIdx = appState.pages.findIndex((p) => p.id === page.id);
+      if (pageIdx !== -1) appState.pages[pageIdx] = data.page;
+      flashSaved();
+      if (data.prevPage) {
+        recordUndo('auto-compose', () => api('PUT', `/api/pages/${page.id}/replace`, { page: data.prevPage })
+          .then((d) => {
+            const idx = appState.pages.findIndex((p) => p.id === page.id);
+            if (idx !== -1) appState.pages[idx] = d.page;
+            flashSaved();
+            renderEditorCanvas();
+          })
+          .catch((err) => flashError(err.message)));
+      }
+    } catch (err) {
+      flashError(err.message);
+    }
+    renderEditorCanvas();
+  }
+
   function jumpToPage(pageNumber) {
     if (!appState.pages.length || isNaN(pageNumber)) return;
     const idx = Math.min(appState.pages.length, Math.max(1, pageNumber)) - 1;
     currentPageIndex = idx;
     renderEditorCanvas();
     renderPageRail();
+    updateSpreadPreview();
     const target = $(`.rail-page[data-idx="${idx}"]`);
     if (target) target.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+  }
+
+  // A printed album is bound as spreads (two facing pages), not single
+  // sheets, so a photo near the gutter can get awkwardly split in a way
+  // that's invisible editing one page at a time. This shows the facing
+  // page as a static snapshot (its real rendered PNG, via the same
+  // single-page export this app already has) next to the live, editable
+  // current page -- a snapshot rather than a second live stage, since
+  // making two pages simultaneously interactive would mean duplicating
+  // every drag/drop handler for a second page.
+  //
+  // Pairing follows ordinary book pagination: page 1 faces page 2, page 3
+  // faces page 4, and so on (0-indexed: even internal index pairs with the
+  // next one; odd pairs with the previous one).
+  function updateSpreadPreview() {
+    const row = $('#pageStageRow');
+    const enabled = $('#spreadViewToggle').checked;
+    $('#spreadViewRefreshBtn').hidden = !enabled;
+    if (!enabled || appState.pages.length === 0) {
+      $('#spreadPreview').hidden = true;
+      row.classList.remove('spread-active', 'spread-preview-left');
+      return;
+    }
+    const isLeftPage = currentPageIndex % 2 === 0;
+    const pairIdx = isLeftPage ? currentPageIndex + 1 : currentPageIndex - 1;
+    row.classList.add('spread-active');
+    row.classList.toggle('spread-preview-left', !isLeftPage);
+    const pairPage = appState.pages[pairIdx];
+    if (!pairPage) {
+      $('#spreadPreview').hidden = true;
+      return;
+    }
+    $('#spreadPreview').hidden = false;
+    $('#spreadPreviewLabel').textContent = `Page ${pairIdx + 1} (facing page -- snapshot, not live)`;
+    $('#spreadPreviewImg').src = `/api/pages/${pairPage.id}/export?format=png&t=${Date.now()}`;
   }
 
   function syncPageSizeControls() {
@@ -670,9 +954,26 @@
       (key) => PAGE_SIZE_PRESETS[key].widthIn === widthIn && PAGE_SIZE_PRESETS[key].heightIn === heightIn
     );
     $('#pageSizePreset').value = matchedPreset || 'custom';
-    $('#pageSizeCustomInputs').hidden = !!matchedPreset;
     $('#pageSizeWidth').value = widthIn;
     $('#pageSizeHeight').value = heightIn;
+  }
+
+  // Picking "Custom size..." pops this up to ask for width/height, instead
+  // of inline inputs sitting in the already-crowded page-settings row.
+  function openPageSizeModal() {
+    $('#pageSizeWidth').value = appState.pageSize.widthIn;
+    $('#pageSizeHeight').value = appState.pageSize.heightIn;
+    $('#pageSizeModal').classList.add('active');
+    $('#pageSizeWidth').focus();
+  }
+
+  // Canceling (or closing without applying) doesn't change the sheet size,
+  // so the dropdown goes back to whatever preset actually matches the
+  // current size -- it shouldn't keep reading "Custom size..." if the
+  // album is still on, say, Landscape.
+  function closePageSizeModal() {
+    $('#pageSizeModal').classList.remove('active');
+    syncPageSizeControls();
   }
 
   function renderEditorTab() {
@@ -692,6 +993,86 @@
     const unusedOnly = $('#editorUnusedOnly').checked;
     const filtered = filterPhotos(appState.photos, { search, favOnly, unusedOnly });
     renderPhotoGrid($('#editorLibraryGrid'), filtered, { draggable: true });
+    renderRemovedTray();
+  }
+
+  // The Removed tray: photos pulled out of a slot or floating spot (and not
+  // still placed anywhere else) live here instead of being deleted outright.
+  // Cards are deliberately NOT built with photoCardHtml/renderPhotoGrid --
+  // those assume the photo is in appState.photos (for the favorite-star
+  // handler), which a tray photo, by definition, no longer is.
+  function renderRemovedTray() {
+    const removed = appState.removedPhotos || [];
+    $('#removedTrayCount').textContent = removed.length;
+    $('#removedTrayGrid').innerHTML = removed.map((p) => `
+      <div class="photo-card" data-id="${p.id}" draggable="true">
+        <img src="/api/thumb/${p.id}" alt="${escapeHtml(p.filename)}" loading="lazy" />
+        <button class="removed-delete-btn" title="Delete for good" data-action="delete">&times;</button>
+        <span class="filename-label">${escapeHtml(p.filename)}</span>
+      </div>`).join('');
+    $$('#removedTrayGrid .photo-card').forEach((card) => {
+      const id = card.dataset.id;
+      card.addEventListener('dragstart', (e) => {
+        slotDragSource = null;
+        e.dataTransfer.setData('text/plain', id);
+      });
+      card.querySelector('[data-action="delete"]').addEventListener('click', (e) => {
+        e.stopPropagation();
+        deleteRemovedPhoto(id);
+      });
+    });
+  }
+
+  async function deleteRemovedPhoto(id) {
+    const confirmed = window.confirm("Permanently delete this photo? This can't be undone.");
+    if (!confirmed) return;
+    try {
+      await api('POST', `/api/removed-photos/${id}/delete`, {});
+      flashSaved();
+    } catch (err) {
+      flashError(err.message);
+      return;
+    }
+    renderRemovedTray();
+  }
+
+  async function deleteAllRemovedPhotos() {
+    if (!appState.removedPhotos || appState.removedPhotos.length === 0) return;
+    const confirmed = window.confirm(
+      `Permanently delete all ${appState.removedPhotos.length} photo(s) in the Removed tray? This can't be undone.`
+    );
+    if (!confirmed) return;
+    try {
+      await api('POST', '/api/removed-photos/delete-all', {});
+      flashSaved();
+    } catch (err) {
+      flashError(err.message);
+      return;
+    }
+    renderRemovedTray();
+  }
+
+  // Sweeps the whole library in one pass: anything not currently placed in
+  // a slot or floating spot on any page moves to the Removed tray, instead
+  // of waiting for each one to be pulled out of a slot individually --
+  // catches photos that were never placed at all, not just ones that once
+  // were and got removed.
+  async function sweepUnusedPhotos() {
+    let movedCount = 0;
+    try {
+      const data = await api('POST', '/api/removed-photos/sweep-unused', {});
+      movedCount = data.movedCount;
+    } catch (err) {
+      flashError(err.message);
+      return;
+    }
+    const el = $('#saveIndicator');
+    el.textContent = movedCount > 0 ? `Moved ${movedCount} unused photo(s) to Removed` : 'No unused photos to move';
+    el.style.color = '#3b7a3b';
+    clearTimeout(flashSaved._t);
+    flashSaved._t = setTimeout(() => { el.textContent = ''; }, 2500);
+    renderEditorLibrary();
+    if ($('#tab-library').classList.contains('active')) renderLibraryTab();
   }
 
   async function applyPageSize(widthIn, heightIn) {
@@ -877,7 +1258,7 @@
       const isFreeCrop = slot.crop && slot.crop.mode === 'free';
       const cropStyle = (slot.crop && !isFreeCrop
         ? `position:absolute; left:${(-slot.crop.x / slot.crop.w * 100).toFixed(3)}%; top:${(-slot.crop.y / slot.crop.h * 100).toFixed(3)}%; width:${(100 / slot.crop.w).toFixed(3)}%; height:${(100 / slot.crop.h).toFixed(3)}%; object-fit:fill;`
-        : '') + photoTransformStyle(slot.mirrored, slot.rotation);
+        : '') + photoTransformStyle(slot.mirrored, slot.rotation, slot.filter);
       const imgSrc = isFreeCrop
         ? `/api/crop-preview/${slot.photoId}?x=${slot.crop.x}&y=${slot.crop.y}&w=${slot.crop.w}&h=${slot.crop.h}`
         : `/api/thumb/${slot.photoId}`;
@@ -979,7 +1360,7 @@
       // never carries a text/plain payload matching one of our own photo
       // ids, so checking that first is unambiguous either way.
       const photoId = e.dataTransfer.getData('text/plain');
-      const isKnownPhoto = photoId && appState.photos.some((p) => p.id === photoId);
+      const isKnownPhoto = isAppPhotoId(photoId);
 
       if (!isKnownPhoto && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
         // A drag from File Explorer (or any source that hands over a real
@@ -1026,11 +1407,25 @@
   // rotation state, composed so mirroring happens first (in the photo's own
   // space) and rotation second -- matching the order server/pdfExporter.js
   // uses for the PDF export, so the preview and the printed result agree.
-  function photoTransformStyle(mirrored, rotation) {
+  // Also appends the CSS `filter:` for the photo's color filter, if any --
+  // the preview-side counterpart of the sharp operations pdfExporter.js
+  // applies for export, so the two look the same.
+  const FILTER_CSS = {
+    bw: 'grayscale(1)',
+    warm: 'sepia(0.35) saturate(1.15)',
+    cool: 'saturate(1.05) hue-rotate(-6deg)',
+    muted: 'saturate(0.55) contrast(0.95)',
+    vivid: 'saturate(1.5) contrast(1.15)',
+    sepia: 'sepia(0.9) saturate(1.1)',
+    vintage: 'sepia(0.3) saturate(0.6) contrast(0.9) brightness(1.05)'
+  };
+  function photoTransformStyle(mirrored, rotation, filter) {
     const parts = [];
     if (rotation) parts.push(`rotate(${rotation}deg)`);
     if (mirrored) parts.push('scaleX(-1)');
-    return parts.length ? ` transform:${parts.join(' ')};` : '';
+    let style = parts.length ? ` transform:${parts.join(' ')};` : '';
+    if (filter && FILTER_CSS[filter]) style += ` filter:${FILTER_CSS[filter]};`;
+    return style;
   }
 
   // Shared by both floating photos and free-form slot resizing: 8 drag
@@ -1516,6 +1911,7 @@
     const page = appState.pages[currentPageIndex];
 
     $('#layoutPickerBtnLabel').textContent = page ? layoutLabelFor(page.layout) : '';
+    syncCoverControls(page);
 
     if (!page) {
       stage.innerHTML = '<p class="empty-hint">Set a page count above to start designing your album.</p>';
@@ -1551,6 +1947,41 @@
       renderSplitDividers(grid, page);
     }
     renderFloatsLayer(stage, page, usageMap);
+    renderCoverStageOverlay(stage, page);
+  }
+
+  // Keeps the "Cover/title page" checkbox and its three text inputs in
+  // sync with whichever page is current -- called every time the canvas
+  // re-renders, same as the layout label next to it.
+  function syncCoverControls(page) {
+    const checkbox = $('#coverPageToggle');
+    checkbox.checked = !!(page && page.isCover);
+    checkbox.disabled = !page;
+    const show = !!(page && page.isCover);
+    $('#coverTitleInput').hidden = !show;
+    $('#coverSubtitleInput').hidden = !show;
+    $('#coverDateInput').hidden = !show;
+    $('#coverTitleInput').value = (page && page.coverTitle) || '';
+    $('#coverSubtitleInput').value = (page && page.coverSubtitle) || '';
+    $('#coverDateInput').value = (page && page.coverDate) || '';
+  }
+
+  // The live preview counterpart of the overlay drawPage() (PDF) and
+  // renderCoverOverlay() (PNG/JPEG) draw at export time -- a translucent
+  // band across the bottom of the stage with the title/subtitle/date
+  // centered in it. Purely visual (pointer-events: none), so it never
+  // blocks clicking a slot underneath it.
+  function renderCoverStageOverlay(stage, page) {
+    if (!page.isCover) return;
+    const overlay = document.createElement('div');
+    overlay.className = 'cover-overlay';
+    overlay.innerHTML = `
+      <div class="cover-overlay-band">
+        ${page.coverTitle ? `<div class="cover-overlay-title">${escapeHtml(page.coverTitle)}</div>` : ''}
+        ${page.coverSubtitle ? `<div class="cover-overlay-subtitle">${escapeHtml(page.coverSubtitle)}</div>` : ''}
+        ${page.coverDate ? `<div class="cover-overlay-date">${escapeHtml(page.coverDate)}</div>` : ''}
+      </div>`;
+    stage.appendChild(overlay);
   }
 
   function layoutLabelFor(layoutId) {
@@ -1579,7 +2010,7 @@
         ? 'object-fit:contain;'
         : float.crop
           ? `position:absolute; left:${(-float.crop.x / float.crop.w * 100).toFixed(3)}%; top:${(-float.crop.y / float.crop.h * 100).toFixed(3)}%; width:${(100 / float.crop.w).toFixed(3)}%; height:${(100 / float.crop.h).toFixed(3)}%; object-fit:fill;`
-          : '') + photoTransformStyle(float.mirrored, float.rotation);
+          : '') + photoTransformStyle(float.mirrored, float.rotation, float.filter);
       const imgSrc = isFreeCrop
         ? `/api/crop-preview/${float.photoId}?x=${float.crop.x}&y=${float.crop.y}&w=${float.crop.w}&h=${float.crop.h}`
         : `/api/thumb/${float.photoId}`;
@@ -1649,7 +2080,7 @@
       // browsers populate files with a synthetic image for an in-page
       // <img> drag too, not just a real drop from outside the browser.
       const photoId = e.dataTransfer.getData('text/plain');
-      const isKnownPhoto = photoId && appState.photos.some((p) => p.id === photoId);
+      const isKnownPhoto = isAppPhotoId(photoId);
 
       if (!isKnownPhoto && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
         await importFileIntoFloat(page.id, float.id, e.dataTransfer.files[0], tile);
@@ -1677,6 +2108,7 @@
       flashError(err.message);
     }
     renderEditorCanvas();
+    renderEditorLibrary();
   }
 
   async function importFileIntoFloat(pageId, floatId, file, tileEl) {
@@ -1854,7 +2286,7 @@
       // library photo onto the background was silently uploading a brand
       // new duplicate copy of it instead of reusing the original.
       const photoId = e.dataTransfer.getData('text/plain');
-      if (photoId && appState.photos.some((p) => p.id === photoId)) {
+      if (isAppPhotoId(photoId)) {
         await addFloatAtPosition(page.id, photoId, dropX, dropY);
         return;
       }
@@ -1882,6 +2314,7 @@
       flashError(err.message);
     }
     renderEditorCanvas();
+    renderEditorLibrary();
   }
 
   async function importFileAsFloat(pageId, file, dropX, dropY) {
@@ -2027,6 +2460,7 @@
         currentPageIndex = parseInt(el.dataset.idx, 10);
         renderEditorCanvas();
         renderPageRail();
+        updateSpreadPreview();
       });
 
       el.addEventListener('dragstart', (e) => {
@@ -2132,6 +2566,8 @@
     if (cropState) { closeCropEditor(); return true; }
     if ($('#pickerModal').classList.contains('active')) { closePicker(); return true; }
     if ($('#layoutModal').classList.contains('active')) { closeLayoutModal(); return true; }
+    if ($('#pageSizeModal').classList.contains('active')) { closePageSizeModal(); return true; }
+    if ($('#stylePresetsModal').classList.contains('active')) { closeStylePresetsModal(); return true; }
     if ($('#oneDriveModal').classList.contains('active')) { closeOneDriveModal(); return true; }
     if ($('#lightbox').classList.contains('active')) { $('#lightbox').classList.remove('active'); return true; }
     return false;
@@ -2208,7 +2644,7 @@
           const recreated = createData.page.floats[createData.page.floats.length - 1];
           const putData = await api('PUT', `/api/pages/${pageId}/floats/${recreated.id}`, {
             x: removedFloat.x, y: removedFloat.y, w: removedFloat.w, h: removedFloat.h,
-            crop: removedFloat.crop, shape: removedFloat.shape, mirrored: removedFloat.mirrored, rotation: removedFloat.rotation
+            crop: removedFloat.crop, shape: removedFloat.shape, mirrored: removedFloat.mirrored, rotation: removedFloat.rotation, filter: removedFloat.filter
           });
           const idx = appState.pages.findIndex((p) => p.id === pageId);
           if (idx !== -1) appState.pages[idx] = putData.page;
@@ -2217,11 +2653,13 @@
           flashError(err.message);
         }
         renderEditorCanvas();
+        renderEditorLibrary();
       });
     } catch (err) {
       flashError(err.message);
     }
     renderEditorCanvas();
+    renderEditorLibrary();
   }
 
   async function assignSlot(pageId, slotIndex, body) {
@@ -2246,7 +2684,7 @@
       flashSaved();
       if (prevSlot) {
         recordUndo('slot edit', () => assignSlot(pageId, slotIndex, prevSlot.photoId
-          ? { photoId: prevSlot.photoId, hero: prevSlot.hero, crop: prevSlot.crop, shape: prevSlot.shape, mirrored: prevSlot.mirrored, rotation: prevSlot.rotation, keepCrop: true }
+          ? { photoId: prevSlot.photoId, hero: prevSlot.hero, crop: prevSlot.crop, shape: prevSlot.shape, mirrored: prevSlot.mirrored, rotation: prevSlot.rotation, filter: prevSlot.filter, keepCrop: true }
           : { remove: true }));
       }
     } catch (err) {
@@ -2262,7 +2700,7 @@
   // (the normal `remove` behavior), it is NOT backfilled with anything, so
   // the rest of the layout doesn't shift around the way removing a photo
   // from the middle of a list might suggest.
-  async function convertSlotToFloat(pageId, slotIndex, photoId, shape, mirrored, rotation, slotEl) {
+  async function convertSlotToFloat(pageId, slotIndex, photoId, shape, mirrored, rotation, filter, slotEl) {
     try {
       const stage = document.getElementById('pageStage');
       const stageRect = stage ? stage.getBoundingClientRect() : null;
@@ -2285,8 +2723,8 @@
         page = moveData.page;
       }
 
-      if (newFloat && (shape || mirrored || rotation)) {
-        const shapeData = await api('PUT', `/api/pages/${pageId}/floats/${newFloat.id}`, { shape, mirrored, rotation });
+      if (newFloat && (shape || mirrored || rotation || filter)) {
+        const shapeData = await api('PUT', `/api/pages/${pageId}/floats/${newFloat.id}`, { shape, mirrored, rotation, filter });
         page = shapeData.page;
       }
 
@@ -2310,7 +2748,7 @@
   // filled with something else by now), so this just claims whichever slot
   // is free -- if none is, it says so rather than guessing which photo to
   // displace.
-  async function convertFloatToSlot(pageId, floatId, photoId, shape, mirrored, rotation) {
+  async function convertFloatToSlot(pageId, floatId, photoId, shape, mirrored, rotation, filter) {
     const page = appState.pages.find((p) => p.id === pageId);
     if (!page) return;
     const emptyIndex = page.slots.findIndex((s) => !s.photoId);
@@ -2319,7 +2757,7 @@
       return;
     }
     try {
-      await api('PUT', `/api/pages/${pageId}/slot/${emptyIndex}`, { photoId, shape, mirrored, rotation });
+      await api('PUT', `/api/pages/${pageId}/slot/${emptyIndex}`, { photoId, shape, mirrored, rotation, filter });
       const data = await api('DELETE', `/api/pages/${pageId}/floats/${floatId}`);
       const pageIdx = appState.pages.findIndex((p) => p.id === pageId);
       if (pageIdx !== -1) appState.pages[pageIdx] = data.page;
@@ -2621,7 +3059,8 @@
       rect: mode === 'free' ? { x: existingCrop.x, y: existingCrop.y, w: existingCrop.w, h: existingCrop.h } : null,
       shape: item.shape || null,
       mirrored: !!item.mirrored,
-      rotation: item.rotation || 0
+      rotation: item.rotation || 0,
+      filter: item.filter || null
     };
   }
 
@@ -2641,6 +3080,9 @@
     });
     $('#cropMirrorToggle').checked = !!cropState.mirrored;
     $('#cropRotationLabel').textContent = `${cropState.rotation || 0}°`;
+    $$('.crop-filter-option').forEach((btn) => {
+      btn.classList.toggle('active', (btn.dataset.filter === 'none' ? null : btn.dataset.filter) === (cropState.filter || null));
+    });
     $('#cropFloatToggleBtn').textContent = cropState.floatId !== undefined
       ? 'Put back into a regular slot'
       : 'Make this a floating photo';
@@ -2783,6 +3225,14 @@
       });
     });
 
+    $$('.crop-filter-option').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        if (!cropState) return;
+        cropState.filter = btn.dataset.filter === 'none' ? null : btn.dataset.filter;
+        updateCropExtraUI();
+      });
+    });
+
     $('#cropMirrorToggle').addEventListener('change', (e) => {
       if (!cropState) return;
       cropState.mirrored = e.target.checked;
@@ -2806,13 +3256,13 @@
     // longer holds this photo.
     $('#cropFloatToggleBtn').addEventListener('click', async () => {
       if (!cropState) return;
-      const { pageId, slotIndex, floatId, photoId, shape, mirrored, rotation } = cropState;
+      const { pageId, slotIndex, floatId, photoId, shape, mirrored, rotation, filter } = cropState;
       closeCropEditor();
       if (floatId !== undefined) {
-        await convertFloatToSlot(pageId, floatId, photoId, shape, mirrored, rotation);
+        await convertFloatToSlot(pageId, floatId, photoId, shape, mirrored, rotation, filter);
       } else {
         const slotEl = document.querySelector(`#pageStage .slot[data-slot-index="${slotIndex}"]`);
-        await convertSlotToFloat(pageId, slotIndex, photoId, shape, mirrored, rotation, slotEl);
+        await convertSlotToFloat(pageId, slotIndex, photoId, shape, mirrored, rotation, filter, slotEl);
       }
     });
 
@@ -2824,18 +3274,18 @@
     $('#cropDoneBtn').addEventListener('click', async () => {
       if (!cropState) return;
       const crop = currentCropRectFraction();
-      const { pageId, slotIndex, floatId, shape, mirrored, rotation } = cropState;
+      const { pageId, slotIndex, floatId, shape, mirrored, rotation, filter } = cropState;
       if (floatId !== undefined) {
         const page = appState.pages.find((p) => p.id === pageId);
         const prevFloat = page ? JSON.parse(JSON.stringify(page.floats.find((f) => f.id === floatId))) : null;
         try {
-          const data = await api('PUT', `/api/pages/${pageId}/floats/${floatId}`, { crop, shape, mirrored, rotation });
+          const data = await api('PUT', `/api/pages/${pageId}/floats/${floatId}`, { crop, shape, mirrored, rotation, filter });
           const pageIdx = appState.pages.findIndex((p) => p.id === pageId);
           if (pageIdx !== -1) appState.pages[pageIdx] = data.page;
           flashSaved();
           if (prevFloat) {
             recordUndo('float edit', () => api('PUT', `/api/pages/${pageId}/floats/${floatId}`, {
-              crop: prevFloat.crop, shape: prevFloat.shape, mirrored: prevFloat.mirrored, rotation: prevFloat.rotation
+              crop: prevFloat.crop, shape: prevFloat.shape, mirrored: prevFloat.mirrored, rotation: prevFloat.rotation, filter: prevFloat.filter
             }).then((d) => {
               const idx = appState.pages.findIndex((p) => p.id === pageId);
               if (idx !== -1) appState.pages[idx] = d.page;
@@ -2848,13 +3298,101 @@
         }
         renderEditorCanvas();
       } else {
-        await assignSlot(pageId, slotIndex, { crop, shape, mirrored, rotation });
+        await assignSlot(pageId, slotIndex, { crop, shape, mirrored, rotation, filter });
       }
       closeCropEditor();
     });
   }
 
   // ---------------- Export tab ----------------
+
+  // Two simple pacing checks across the whole album, entirely client-side
+  // (no server round trip needed -- appState.pages already has everything):
+  // runs of 3+ consecutive pages sharing the exact same layout, and pages
+  // whose photo count is far above or below the album's average. Neither
+  // is "wrong", just worth a glance before printing.
+  function analyzePageBalance() {
+    const warnings = [];
+    const pages = appState.pages;
+    if (pages.length === 0) return warnings;
+
+    let runStart = 0;
+    for (let i = 1; i <= pages.length; i++) {
+      const sameAsPrev = i < pages.length && pages[i].layout === pages[runStart].layout;
+      if (!sameAsPrev) {
+        const runLen = i - runStart;
+        if (runLen >= 3) {
+          warnings.push({
+            message: `Pages ${runStart + 1}-${i} (${runLen} pages) all use the same layout ("${pages[runStart].layout}").`,
+            jumpPage: runStart + 1
+          });
+        }
+        runStart = i;
+      }
+    }
+
+    const densities = pages.map((p) => p.slots.filter((s) => s.photoId).length + (p.floats || []).length);
+    const avg = densities.reduce((a, b) => a + b, 0) / pages.length;
+    pages.forEach((p, i) => {
+      const count = densities[i];
+      if (count === 0 && avg > 0.5) {
+        warnings.push({ message: `Page ${i + 1} has no photos placed.`, jumpPage: i + 1 });
+      } else if (avg >= 1.5 && count > avg * 1.75) {
+        warnings.push({ message: `Page ${i + 1} has ${count} photos, well above the album's average of ${avg.toFixed(1)}.`, jumpPage: i + 1 });
+      } else if (avg >= 2 && count > 0 && count < avg * 0.4) {
+        warnings.push({ message: `Page ${i + 1} has only ${count} photo(s), well below the album's average of ${avg.toFixed(1)}.`, jumpPage: i + 1 });
+      }
+    });
+
+    return warnings;
+  }
+
+  function runVarietyCheck() {
+    const warnings = analyzePageBalance();
+    if (warnings.length === 0) {
+      setStatus('#varietyCheckStatus', 'No layout runs or density outliers found -- the album looks well-paced.', false, true);
+      $('#varietyCheckResults').innerHTML = '';
+      return;
+    }
+    setStatus('#varietyCheckStatus', `${warnings.length} thing(s) worth a look:`, false, true);
+    $('#varietyCheckResults').innerHTML = warnings.map((w) => `
+      <div class="variety-check-row">
+        <span>${escapeHtml(w.message)}</span>
+        <button data-jump-page="${w.jumpPage}">Jump to Page</button>
+      </div>`).join('');
+  }
+
+  // Asks the server to flag any placed photo whose actual resolution won't
+  // cover its printed size at a reasonable quality (see the print-check
+  // route's comment for the DPI math -- it reuses the exact layout math
+  // the PDF export itself uses, so what it checks against matches what
+  // will actually print).
+  async function runPrintCheck() {
+    setStatus('#printCheckStatus', 'Checking every placed photo\'s resolution against its printed size...', false);
+    let data;
+    try {
+      data = await api('GET', '/api/photos/print-check');
+    } catch (err) {
+      setStatus('#printCheckStatus', err.message, true);
+      return;
+    }
+    if (data.warnings.length === 0) {
+      setStatus('#printCheckStatus', 'Every placed photo looks high enough resolution for its printed size.', false, true);
+      $('#printCheckResults').innerHTML = '';
+      return;
+    }
+    setStatus(
+      '#printCheckStatus',
+      `${data.warnings.length} photo(s) are below ~${data.threshold} DPI at their printed size:`,
+      false, true
+    );
+    $('#printCheckResults').innerHTML = data.warnings.map((w) => `
+      <div class="print-check-row">
+        <span class="print-check-dpi">~${w.dpi} DPI</span>
+        <span>${escapeHtml(w.filename)} -- page ${w.pageIndex + 1} (${w.type === 'slot' ? 'slot' : 'floating photo'})</span>
+        <button data-jump-page="${w.pageIndex + 1}">Jump to Page</button>
+      </div>`).join('');
+  }
 
   function initExportTab() {
     $('#exportPhotographerBtn').addEventListener('click', async () => {
@@ -2889,6 +3427,29 @@
       } catch (err) {
         setStatus('#exportPdfStatus', err.message, true);
       }
+    });
+
+    $('#printCheckBtn').addEventListener('click', () => runPrintCheck());
+    $('#printCheckResults').addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-jump-page]');
+      if (!btn) return;
+      $('.tab-btn[data-tab="editor"]').click();
+      jumpToPage(parseInt(btn.dataset.jumpPage, 10));
+    });
+
+    $('#varietyCheckBtn').addEventListener('click', () => runVarietyCheck());
+    $('#varietyCheckResults').addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-jump-page]');
+      if (!btn) return;
+      $('.tab-btn[data-tab="editor"]').click();
+      jumpToPage(parseInt(btn.dataset.jumpPage, 10));
+    });
+
+    $('#pagesZipBtn').addEventListener('click', () => {
+      const format = $('#pagesZipFormat').value;
+      setStatus('#pagesZipStatus', `Generating a ZIP of ${appState.pages.length} page(s) as ${format.toUpperCase()}... this may take a moment for a large album.`, false);
+      window.location = `/api/export/pages-zip?format=${format}`;
+      setTimeout(() => setStatus('#pagesZipStatus', 'Download started.', false, true), 1500);
     });
 
     $('#exportsList').addEventListener('click', async (e) => {
@@ -2957,6 +3518,7 @@
     initLibraryTab();
     initEditorTab();
     initCropEditor();
+    initStylePresetsModal();
     initExportTab();
     initOneDriveModal();
     initProjectChooser();

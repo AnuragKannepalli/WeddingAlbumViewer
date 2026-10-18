@@ -82,9 +82,13 @@
     <div class="library-toolbar">
       <input type="text" id="librarySearch" placeholder="Search by filename..." />
       <label class="checkbox"><input type="checkbox" id="favOnlyToggle" /> Favorites only</label>
+      <label class="checkbox"><input type="checkbox" id="visualDupOnlyToggle" /> Likely duplicates only</label>
+      <button id="scanDuplicatesBtn" title="Compare every photo's actual visual content to find near-identical shots">Scan for Duplicates</button>
       <button id="libraryOneDriveBtn">Add from OneDrive&hellip;</button>
       <span class="count-badge" id="libraryCount"></span>
+      <span class="count-badge" id="libraryPlacedCount" title="Photos currently placed somewhere in the album"></span>
     </div>
+    <p id="scanDuplicatesStatus" class="status"></p>
     <div class="selection-bar" id="librarySelectionBar" hidden>
       <span id="librarySelectionCount"></span>
       <button id="selFavBtn">Favorite</button>
@@ -115,6 +119,7 @@
           <button id="layoutPickerBtn" class="layout-picker-btn">Layout: <span id="layoutPickerBtnLabel">1 photo</span> &#9662;</button>
           <label class="checkbox"><input type="checkbox" id="layoutGapToggle" /> Gap between photos</label>
           <label class="checkbox"><input type="checkbox" id="keepCropOnReplaceToggle" /> Keep crop/shape when replacing a photo</label>
+          <button id="fillEmptySlotsBtn" title="Fill every empty slot across the whole album with your next unused favorite photo">Fill Empty Slots</button>
           <button id="addFloatBtn">+ Add Floating Photo</button>
           <button id="undoLastEditBtn" title="Undo your last crop/shape/mirror/rotate/hero/remove edit" disabled>&#8634; Undo Last Edit</button>
           <div class="page-nav-btns">
@@ -122,11 +127,22 @@
             <button id="pageMoveDown" title="Move page later">&#8595;</button>
             <button id="pageDuplicateBtn" title="Duplicate this page">Duplicate Page</button>
             <button id="pageDeleteBtn" class="danger" title="Delete this page">Delete Page</button>
+            <select id="pageExportFormat" title="Format to download this page in">
+              <option value="pdf">PDF</option>
+              <option value="png">PNG</option>
+              <option value="jpeg">JPEG</option>
+            </select>
+            <button id="pageExportBtn" title="Download just this page">Download Page</button>
           </div>
         </div>
-        <p class="hint">Drag the divider lines on the page below to resize how much space each photo gets. You can drag a photo (from the library or File Explorer) onto any slot, onto empty page background to add it as a new floating photo, or onto an existing floating photo to swap in a different picture.</p>
+        <div class="editor-canvas-header cover-page-row">
+          <label class="checkbox"><input type="checkbox" id="coverPageToggle" /> This is a cover/title page</label>
+          <input type="text" id="coverTitleInput" placeholder="Title (e.g. names)" hidden />
+          <input type="text" id="coverSubtitleInput" placeholder="Subtitle" hidden />
+          <input type="text" id="coverDateInput" placeholder="Date" hidden />
+        </div>
         <div class="editor-canvas-header page-style-row">
-          <span class="crop-extra-label">Apply to every photo on this page</span>
+          <span class="crop-extra-label">Apply to every photo</span>
           <div class="crop-shape-options" id="pageShapeOptions">
             <button class="crop-shape-option" data-shape="none" title="None (rectangle)"><span class="shape-swatch shape-none"></span></button>
             <button class="crop-shape-option" data-shape="circle" title="Circle"><span class="shape-swatch shape-circle"></span></button>
@@ -136,8 +152,23 @@
             <button class="crop-shape-option" data-shape="heart" title="Heart"><span class="shape-swatch shape-heart"></span></button>
           </div>
           <button id="pageMirrorAllBtn">Mirror All</button>
-        </div>
-        <div class="editor-canvas-header">
+          <label>Filter all
+            <select id="pageFilterAllSelect">
+              <option value="none">None</option>
+              <option value="warm">Warm</option>
+              <option value="cool">Cool</option>
+              <option value="muted">Muted</option>
+              <option value="vivid">Vivid</option>
+              <option value="sepia">Sepia</option>
+              <option value="vintage">Vintage</option>
+              <option value="bw">B&amp;W</option>
+            </select>
+          </label>
+          <button id="pageFilterAllBtn">Apply Filter</button>
+          <button id="pageAutoComposeBtn" title="Automatically float an oddly-shaped photo and apply a light filter mix across this page">Auto-Compose Page</button>
+          <button id="pageStylePresetsBtn" title="Save or apply a named shape/mirror/filter combo to this page">Style Presets&hellip;</button>
+          <label class="checkbox"><input type="checkbox" id="spreadViewToggle" /> Spread view</label>
+          <button id="spreadViewRefreshBtn" hidden title="Re-render the facing page preview (it's a snapshot, not live)">&#8635; Refresh Facing Page</button>
           <label>Sheet size
             <select id="pageSizePreset">
               <option value="landscape">Landscape (11 &times; 8.5 in)</option>
@@ -152,22 +183,31 @@
               <option value="custom">Custom size&hellip;</option>
             </select>
           </label>
-          <div id="pageSizeCustomInputs" class="page-size-custom" hidden>
-            <label>Width (in)
-              <input type="number" id="pageSizeWidth" min="1" step="0.1" />
-            </label>
-            <label>Height (in)
-              <input type="number" id="pageSizeHeight" min="1" step="0.1" />
-            </label>
-            <button id="pageSizeApplyBtn">Apply</button>
-          </div>
         </div>
-        <div class="page-stage" id="pageStage">
-          <p class="empty-hint">Set a page count above to start designing your album.</p>
+        <div class="page-stage-row" id="pageStageRow">
+          <div class="page-stage" id="pageStage" title="Drag the divider lines to resize how much space each photo gets. Drag a photo onto any slot, onto empty background to make it a new floating photo, or onto an existing floating photo to swap it.">
+            <p class="empty-hint">Set a page count above to start designing your album.</p>
+          </div>
+          <div class="spread-preview" id="spreadPreview" hidden>
+            <span class="spread-preview-label" id="spreadPreviewLabel"></span>
+            <img id="spreadPreviewImg" alt="Facing page preview" />
+          </div>
         </div>
         <input type="file" id="slotFileInput" accept="image/*" hidden />
         <p id="slotUploadStatus" class="status"></p>
       </section>
+
+      <aside class="removed-tray-panel">
+        <button id="sweepUnusedBtn" title="Move every library photo not currently placed in a slot or floating spot into the Removed tray">Move Unused to Removed</button>
+        <div class="removed-tray-box">
+          <div class="removed-tray-header">
+            <span>Removed (<span id="removedTrayCount">0</span>)</span>
+            <button id="removedTrayDeleteAllBtn" class="danger">Delete All</button>
+          </div>
+          <p class="hint">Photos removed from a slot or floating spot land here. Drag one back into a slot to restore it, or delete it for good.</p>
+          <div class="photo-grid small" id="removedTrayGrid"></div>
+        </div>
+      </aside>
     </div>
 
     <div class="page-rail-row">
@@ -183,6 +223,32 @@
     <div class="panel-card">
       <h2>Summary</h2>
       <p id="exportSummary" class="hint"></p>
+    </div>
+    <div class="panel-card">
+      <h2>Print Quality Check</h2>
+      <p class="hint">Flags any placed photo whose resolution is too low for how large it's printed at its current crop (below ~150 DPI). Low resolution won't stop an export, but it may look soft or pixelated on paper.</p>
+      <button id="printCheckBtn">Check Print Quality</button>
+      <p id="printCheckStatus" class="status"></p>
+      <div id="printCheckResults"></div>
+    </div>
+    <div class="panel-card">
+      <h2>Page Variety Check</h2>
+      <p class="hint">Flags runs of pages using the same layout back-to-back, and pages whose photo count is far above or below the album's average -- a quick way to spot pacing issues before printing.</p>
+      <button id="varietyCheckBtn">Check Page Variety</button>
+      <p id="varietyCheckStatus" class="status"></p>
+      <div id="varietyCheckResults"></div>
+    </div>
+    <div class="panel-card">
+      <h2>Download Pages as Images</h2>
+      <p class="hint">Every page rendered as a separate image file in one ZIP -- handy for sharing a few pages by text or social media without sending the whole PDF.</p>
+      <label>Format
+        <select id="pagesZipFormat">
+          <option value="png">PNG</option>
+          <option value="jpeg">JPEG</option>
+        </select>
+      </label>
+      <button id="pagesZipBtn">Download All Pages as Images</button>
+      <p id="pagesZipStatus" class="status"></p>
     </div>
     <div class="panel-card">
       <h2>A. For the Photographer</h2>
@@ -276,6 +342,19 @@
           </div>
         </div>
         <div class="crop-extra-row">
+          <span class="crop-extra-label">Filter</span>
+          <div class="crop-filter-options">
+            <button class="crop-filter-option" data-filter="none">None</button>
+            <button class="crop-filter-option" data-filter="warm">Warm</button>
+            <button class="crop-filter-option" data-filter="cool">Cool</button>
+            <button class="crop-filter-option" data-filter="muted">Muted</button>
+            <button class="crop-filter-option" data-filter="vivid">Vivid</button>
+            <button class="crop-filter-option" data-filter="sepia">Sepia</button>
+            <button class="crop-filter-option" data-filter="vintage">Vintage</button>
+            <button class="crop-filter-option" data-filter="bw">B&amp;W</button>
+          </div>
+        </div>
+        <div class="crop-extra-row">
           <label class="checkbox"><input type="checkbox" id="cropMirrorToggle" /> Mirror (flip horizontally)</label>
           <div class="crop-rotate-buttons">
             <button id="cropRotateLeftBtn" title="Rotate left 90&deg;">&#8634;</button>
@@ -291,6 +370,68 @@
     <div class="modal-footer">
       <button id="cropCancelBtn">Cancel</button>
       <button id="cropDoneBtn" class="primary">Done</button>
+    </div>
+  </div>
+</div>
+
+<!-- Custom sheet size -->
+<div class="modal-backdrop" id="pageSizeModal">
+  <div class="modal page-size-modal">
+    <div class="modal-header">
+      <h3>Custom Sheet Size</h3>
+      <button id="pageSizeModalClose" class="icon-btn">&times;</button>
+    </div>
+    <label>Width (in)
+      <input type="number" id="pageSizeWidth" min="1" step="0.1" />
+    </label>
+    <label>Height (in)
+      <input type="number" id="pageSizeHeight" min="1" step="0.1" />
+    </label>
+    <div class="modal-footer">
+      <button id="pageSizeCancelBtn">Cancel</button>
+      <button id="pageSizeApplyBtn" class="primary">Apply</button>
+    </div>
+  </div>
+</div>
+
+<!-- Page style presets -->
+<div class="modal-backdrop" id="stylePresetsModal">
+  <div class="modal style-presets-modal">
+    <div class="modal-header">
+      <h3>Page Style Presets</h3>
+      <button id="stylePresetsModalClose" class="icon-btn">&times;</button>
+    </div>
+    <p class="hint">Apply a saved preset to the current page, or define a new one below.</p>
+    <div id="stylePresetsList"></div>
+    <div class="style-preset-form">
+      <span class="crop-extra-label">New preset</span>
+      <input type="text" id="newPresetName" placeholder="Preset name&hellip;" />
+      <div class="crop-extra-row">
+        <span class="crop-extra-label">Shape</span>
+        <div class="crop-shape-options" id="newPresetShapeOptions">
+          <button class="crop-shape-option active" data-shape="none" title="None (rectangle)"><span class="shape-swatch shape-none"></span></button>
+          <button class="crop-shape-option" data-shape="circle" title="Circle"><span class="shape-swatch shape-circle"></span></button>
+          <button class="crop-shape-option" data-shape="oval" title="Oval"><span class="shape-swatch shape-oval"></span></button>
+          <button class="crop-shape-option" data-shape="rounded" title="Rounded rectangle"><span class="shape-swatch shape-rounded"></span></button>
+          <button class="crop-shape-option" data-shape="diamond" title="Diamond"><span class="shape-swatch shape-diamond"></span></button>
+          <button class="crop-shape-option" data-shape="heart" title="Heart"><span class="shape-swatch shape-heart"></span></button>
+        </div>
+      </div>
+      <div class="crop-extra-row">
+        <span class="crop-extra-label">Filter</span>
+        <div class="crop-filter-options" id="newPresetFilterOptions">
+          <button class="crop-filter-option active" data-filter="none">None</button>
+          <button class="crop-filter-option" data-filter="warm">Warm</button>
+          <button class="crop-filter-option" data-filter="cool">Cool</button>
+          <button class="crop-filter-option" data-filter="muted">Muted</button>
+          <button class="crop-filter-option" data-filter="vivid">Vivid</button>
+          <button class="crop-filter-option" data-filter="sepia">Sepia</button>
+          <button class="crop-filter-option" data-filter="vintage">Vintage</button>
+          <button class="crop-filter-option" data-filter="bw">B&amp;W</button>
+        </div>
+      </div>
+      <label class="checkbox"><input type="checkbox" id="newPresetMirrored" /> Mirrored</label>
+      <button id="savePresetBtn" class="primary">Save Preset</button>
     </div>
   </div>
 </div>
