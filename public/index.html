@@ -141,6 +141,20 @@
           <input type="text" id="coverSubtitleInput" placeholder="Subtitle" hidden />
           <input type="text" id="coverDateInput" placeholder="Date" hidden />
         </div>
+        <div class="editor-canvas-header background-row">
+          <span class="crop-extra-label">Page background</span>
+          <select id="backgroundTypeSelect">
+            <option value="none">None (white)</option>
+            <option value="solid">Solid color</option>
+            <option value="gradient">Gradient</option>
+            <option value="dots">Dots</option>
+            <option value="stripes">Stripes</option>
+            <option value="grid">Grid</option>
+          </select>
+          <input type="color" id="backgroundColorInput" value="#f3e9dc" />
+          <button id="backgroundApplyBtn">Apply to Page</button>
+          <button id="backgroundApplyAllBtn">Apply to Whole Album</button>
+        </div>
         <div class="editor-canvas-header page-style-row">
           <span class="crop-extra-label">Apply to every photo</span>
           <div class="crop-shape-options" id="pageShapeOptions">

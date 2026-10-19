@@ -13,6 +13,7 @@ const { makePage, resizeSlotsForLayout, nextPageId, defaultSplitsForLayout } = r
 const { exportForPhotographer } = require('./exporter');
 const { exportPdf, renderSinglePagePdfBuffer, layoutRects, MARGIN: PDF_MARGIN } = require('./pdfExporter');
 const { renderPageToImageBuffer } = require('./pageImageExporter');
+const { normalizeBackground } = require('./pageBackground');
 const onedrive = require('./onedrive');
 
 const app = express();
@@ -128,6 +129,7 @@ for (const project of appData.projects) {
     if (page.coverTitle === undefined) page.coverTitle = '';
     if (page.coverSubtitle === undefined) page.coverSubtitle = '';
     if (page.coverDate === undefined) page.coverDate = '';
+    if (page.background === undefined) page.background = { type: 'none', color: '#f3e9dc' };
     for (const float of page.floats) {
       if (float.crop === undefined) float.crop = null;
       if (float.shape === undefined) float.shape = null;
@@ -791,6 +793,7 @@ app.post('/api/history/:id/restore', (req, res) => {
         if (page.coverTitle === undefined) page.coverTitle = '';
         if (page.coverSubtitle === undefined) page.coverSubtitle = '';
         if (page.coverDate === undefined) page.coverDate = '';
+        if (page.background === undefined) page.background = { type: 'none', color: '#f3e9dc' };
         for (const float of page.floats) {
           if (float.crop === undefined) float.crop = null;
           if (float.shape === undefined) float.shape = null;
@@ -1489,6 +1492,31 @@ app.put('/api/pages/:pageId/cover', (req, res) => {
   if (coverDate !== undefined) page.coverDate = String(coverDate).slice(0, 100);
   persist();
   res.json({ ok: true, page });
+});
+
+// Sets a page's background (a solid color or one of a few preset patterns
+// behind the photo layout) -- see pageBackground.js for the shared
+// constants both the PDF and PNG/JPEG exporters draw these patterns from,
+// and drawBackground()/renderBackgroundSvg() in those two files for the
+// actual drawing.
+app.put('/api/pages/:pageId/background', (req, res) => {
+  const state = activeProject();
+  const page = state.pages.find((p) => p.id === req.params.pageId);
+  if (!page) return res.status(404).json({ ok: false, error: 'Page not found' });
+  page.background = normalizeBackground(req.body);
+  persist();
+  res.json({ ok: true, page });
+});
+
+// Applies one background to every page in the album at once, for a
+// consistent look across the whole thing instead of setting it page by
+// page.
+app.put('/api/background/apply-all', (req, res) => {
+  const state = activeProject();
+  const background = normalizeBackground(req.body);
+  for (const page of state.pages) page.background = background;
+  persist();
+  res.json({ ok: true, pages: state.pages });
 });
 
 // "Auto-compose": a lightweight heuristic pass over every filled slot on a

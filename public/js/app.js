@@ -37,6 +37,55 @@
     }[c]));
   }
 
+  function hexToRgba(hex, alpha) {
+    const h = hex.replace('#', '');
+    const r = parseInt(h.substring(0, 2), 16);
+    const g = parseInt(h.substring(2, 4), 16);
+    const b = parseInt(h.substring(4, 6), 16);
+    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+  }
+
+  // The live-preview counterpart of drawBackground() (PDF) and
+  // renderBackgroundSvg() (PNG/JPEG) -- same pattern types and the same
+  // spacing/opacity numbers (kept in sync by hand with pageBackground.js
+  // on the server, since this file can't import a server module), just
+  // expressed as CSS instead of PDFKit commands or an SVG. Sets individual
+  // style properties (not style.cssText) so it never clobbers #pageStage's
+  // other inline style -- applyPageSizeToStage() sets style.aspectRatio on
+  // the same element, and a cssText assignment would wipe that out.
+  function applyPageBackgroundStyle(stage, bg) {
+    stage.style.background = '';
+    stage.style.backgroundColor = '';
+    stage.style.backgroundImage = '';
+    stage.style.backgroundSize = '';
+    if (!bg || bg.type === 'none') return;
+    const color = bg.color || '#f3e9dc';
+    switch (bg.type) {
+      case 'solid':
+        stage.style.backgroundColor = color;
+        break;
+      case 'gradient':
+        stage.style.background = `linear-gradient(to bottom, ${color}, #ffffff)`;
+        break;
+      case 'dots':
+        stage.style.backgroundColor = '#ffffff';
+        stage.style.backgroundImage = `radial-gradient(circle, ${hexToRgba(color, 0.45)} 4px, transparent 4.5px)`;
+        stage.style.backgroundSize = '36px 36px';
+        break;
+      case 'stripes':
+        stage.style.backgroundColor = '#ffffff';
+        stage.style.backgroundImage = `repeating-linear-gradient(to right, ${hexToRgba(color, 0.22)} 0, ${hexToRgba(color, 0.22)} 24px, transparent 24px, transparent 48px)`;
+        break;
+      case 'grid':
+        stage.style.backgroundColor = '#ffffff';
+        stage.style.backgroundImage = `linear-gradient(${hexToRgba(color, 0.28)} 1px, transparent 1px), linear-gradient(to right, ${hexToRgba(color, 0.28)} 1px, transparent 1px)`;
+        stage.style.backgroundSize = '30px 30px';
+        break;
+      default:
+        break;
+    }
+  }
+
   async function api(method, url, body) {
     const isFormData = body instanceof FormData;
     const res = await fetch(url, {
@@ -564,6 +613,13 @@
       input.addEventListener('keydown', (e) => { if (e.key === 'Enter') input.blur(); });
     });
 
+    $('#backgroundApplyBtn').addEventListener('click', () => saveBackground({
+      type: $('#backgroundTypeSelect').value, color: $('#backgroundColorInput').value
+    }));
+    $('#backgroundApplyAllBtn').addEventListener('click', () => applyBackgroundToAlbum({
+      type: $('#backgroundTypeSelect').value, color: $('#backgroundColorInput').value
+    }));
+
     $('#jumpToPageInput').addEventListener('keydown', (e) => {
       if (e.key !== 'Enter') return;
       jumpToPage(parseInt(e.target.value, 10));
@@ -870,6 +926,36 @@
     }
     renderEditorCanvas();
     renderPageRail();
+  }
+
+  // Sets the current page's background (solid color or one of a few
+  // preset patterns behind the photo layout).
+  async function saveBackground(body) {
+    const page = appState.pages[currentPageIndex];
+    if (!page) return;
+    try {
+      const data = await api('PUT', `/api/pages/${page.id}/background`, body);
+      const pageIdx = appState.pages.findIndex((p) => p.id === page.id);
+      if (pageIdx !== -1) appState.pages[pageIdx] = data.page;
+      flashSaved();
+    } catch (err) {
+      flashError(err.message);
+    }
+    renderEditorCanvas();
+  }
+
+  // Same, but for every page in the album at once -- for a consistent
+  // look across the whole thing instead of applying it page by page.
+  async function applyBackgroundToAlbum(body) {
+    try {
+      const data = await api('PUT', '/api/background/apply-all', body);
+      appState.pages = data.pages;
+      flashSaved();
+    } catch (err) {
+      flashError(err.message);
+      return;
+    }
+    renderEditorCanvas();
   }
 
   // Heuristic "auto-compose": asks the server to make a light, automatic
@@ -1912,6 +1998,8 @@
 
     $('#layoutPickerBtnLabel').textContent = page ? layoutLabelFor(page.layout) : '';
     syncCoverControls(page);
+    syncBackgroundControls(page);
+    applyPageBackgroundStyle(stage, page && page.background);
 
     if (!page) {
       stage.innerHTML = '<p class="empty-hint">Set a page count above to start designing your album.</p>';
@@ -1964,6 +2052,16 @@
     $('#coverTitleInput').value = (page && page.coverTitle) || '';
     $('#coverSubtitleInput').value = (page && page.coverSubtitle) || '';
     $('#coverDateInput').value = (page && page.coverDate) || '';
+  }
+
+  // Keeps the background type/color controls in sync with whichever page
+  // is current, same as syncCoverControls above.
+  function syncBackgroundControls(page) {
+    const bg = (page && page.background) || { type: 'none', color: '#f3e9dc' };
+    $('#backgroundTypeSelect').value = bg.type;
+    $('#backgroundColorInput').value = bg.color;
+    $('#backgroundTypeSelect').disabled = !page;
+    $('#backgroundColorInput').disabled = !page;
   }
 
   // The live preview counterpart of the overlay drawPage() (PDF) and

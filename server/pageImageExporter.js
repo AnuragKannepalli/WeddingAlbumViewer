@@ -1,6 +1,11 @@
 const sharp = require('sharp');
 const { getResizedBuffer, getCroppedBuffer } = require('./images');
 const { layoutRects, pageDimensions, applyFilter } = require('./pdfExporter');
+const {
+  DOT_SPACING, DOT_RADIUS, DOT_OPACITY,
+  STRIPE_WIDTH, STRIPE_SPACING, STRIPE_OPACITY,
+  GRID_SPACING, GRID_OPACITY, normalizeBackground
+} = require('./pageBackground');
 
 // Renders one page as a flat raster image (PNG or JPEG) -- a parallel
 // rendering path to pdfExporter.js's drawPage, since PDFKit draws vector
@@ -176,7 +181,8 @@ async function renderPageToImageBuffer(state, pageIndex, format) {
     composites.push({ input: overlay, left: 0, top: 0 });
   }
 
-  const base = sharp({ create: { width: PAGE_W, height: PAGE_H, channels: 3, background: '#ffffff' } }).composite(composites);
+  const bgSvg = renderBackgroundSvg(page, PAGE_W, PAGE_H);
+  const base = sharp(Buffer.from(bgSvg)).composite(composites);
   if (format === 'png') return base.png().toBuffer();
   return base.flatten({ background: '#ffffff' }).jpeg({ quality: 90 }).toBuffer();
 }
@@ -211,6 +217,57 @@ async function renderCoverOverlay(page, PAGE_W, PAGE_H) {
     ${lines.join('\n')}
   </svg>`;
   return sharp(Buffer.from(svg)).png().toBuffer();
+}
+
+// The PNG/JPEG counterpart of drawBackground() in pdfExporter.js -- same
+// patterns (dots/stripes/grid/gradient), same spacing/opacity constants
+// (shared via pageBackground.js), just expressed as SVG <pattern>s so
+// sharp can rasterize them instead of PDFKit drawing them as vectors. This
+// becomes the base image everything else gets composited onto, replacing
+// the plain white canvas a page without a background still gets.
+function renderBackgroundSvg(page, PAGE_W, PAGE_H) {
+  const bg = normalizeBackground(page.background);
+  let content = `<rect width="100%" height="100%" fill="#ffffff"/>`;
+  switch (bg.type) {
+    case 'solid':
+      content = `<rect width="100%" height="100%" fill="${bg.color}"/>`;
+      break;
+    case 'gradient':
+      content = `
+        <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="${bg.color}"/>
+          <stop offset="100%" stop-color="#ffffff"/>
+        </linearGradient></defs>
+        <rect width="100%" height="100%" fill="url(#g)"/>`;
+      break;
+    case 'dots':
+      content = `
+        <defs><pattern id="p" width="${DOT_SPACING}" height="${DOT_SPACING}" patternUnits="userSpaceOnUse">
+          <circle cx="${DOT_SPACING / 2}" cy="${DOT_SPACING / 2}" r="${DOT_RADIUS}" fill="${bg.color}" fill-opacity="${DOT_OPACITY}"/>
+        </pattern></defs>
+        <rect width="100%" height="100%" fill="#ffffff"/>
+        <rect width="100%" height="100%" fill="url(#p)"/>`;
+      break;
+    case 'stripes':
+      content = `
+        <defs><pattern id="p" width="${STRIPE_SPACING}" height="8" patternUnits="userSpaceOnUse">
+          <rect width="${STRIPE_WIDTH}" height="8" fill="${bg.color}" fill-opacity="${STRIPE_OPACITY}"/>
+        </pattern></defs>
+        <rect width="100%" height="100%" fill="#ffffff"/>
+        <rect width="100%" height="100%" fill="url(#p)"/>`;
+      break;
+    case 'grid':
+      content = `
+        <defs><pattern id="p" width="${GRID_SPACING}" height="${GRID_SPACING}" patternUnits="userSpaceOnUse">
+          <path d="M ${GRID_SPACING} 0 L 0 0 0 ${GRID_SPACING}" fill="none" stroke="${bg.color}" stroke-opacity="${GRID_OPACITY}" stroke-width="1"/>
+        </pattern></defs>
+        <rect width="100%" height="100%" fill="#ffffff"/>
+        <rect width="100%" height="100%" fill="url(#p)"/>`;
+      break;
+    default:
+      break; // 'none' -- plain white, already the default content
+  }
+  return `<svg width="${PAGE_W}" height="${PAGE_H}" xmlns="http://www.w3.org/2000/svg">${content}</svg>`;
 }
 
 module.exports = { renderPageToImageBuffer };

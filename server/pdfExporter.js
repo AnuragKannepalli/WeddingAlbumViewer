@@ -4,6 +4,11 @@ const PDFDocument = require('pdfkit');
 const sharp = require('sharp');
 const { getResizedBuffer, getCroppedBuffer } = require('./images');
 const { LAYOUT_ROWS, LAYOUT_REGION_DEFS } = require('./pages');
+const {
+  DOT_SPACING, DOT_RADIUS, DOT_OPACITY,
+  STRIPE_WIDTH, STRIPE_SPACING, STRIPE_OPACITY,
+  GRID_SPACING, GRID_OPACITY, normalizeBackground
+} = require('./pageBackground');
 
 const MARGIN = 30;
 const DEFAULT_SPLITS = {
@@ -310,13 +315,67 @@ async function drawImageCover(doc, buffer, rect, mirrored, rotation, filter) {
   doc.restore();
 }
 
+// Fills the whole page with white first, then (for anything other than
+// "none") layers the chosen pattern on top -- always starting from white
+// means every pattern's own math (dot/stripe/grid spacing, gradient stops)
+// only has to describe the pattern itself, not account for what color was
+// there before.
+function drawBackground(doc, page, PAGE_W, PAGE_H) {
+  doc.rect(0, 0, PAGE_W, PAGE_H).fill('#ffffff');
+  const bg = normalizeBackground(page.background);
+  switch (bg.type) {
+    case 'solid':
+      doc.rect(0, 0, PAGE_W, PAGE_H).fill(bg.color);
+      break;
+    case 'gradient': {
+      const grad = doc.linearGradient(0, 0, 0, PAGE_H);
+      grad.stop(0, bg.color).stop(1, '#ffffff');
+      doc.rect(0, 0, PAGE_W, PAGE_H).fill(grad);
+      break;
+    }
+    case 'dots': {
+      doc.save();
+      for (let y = DOT_SPACING / 2; y < PAGE_H; y += DOT_SPACING) {
+        for (let x = DOT_SPACING / 2; x < PAGE_W; x += DOT_SPACING) {
+          doc.circle(x, y, DOT_RADIUS).fillOpacity(DOT_OPACITY).fill(bg.color);
+        }
+      }
+      doc.restore();
+      break;
+    }
+    case 'stripes': {
+      doc.save();
+      doc.fillOpacity(STRIPE_OPACITY);
+      for (let x = 0; x < PAGE_W; x += STRIPE_SPACING) {
+        doc.rect(x, 0, STRIPE_WIDTH, PAGE_H).fill(bg.color);
+      }
+      doc.restore();
+      break;
+    }
+    case 'grid': {
+      doc.save();
+      doc.strokeOpacity(GRID_OPACITY).strokeColor(bg.color).lineWidth(1);
+      for (let x = 0; x <= PAGE_W; x += GRID_SPACING) {
+        doc.moveTo(x, 0).lineTo(x, PAGE_H).stroke();
+      }
+      for (let y = 0; y <= PAGE_H; y += GRID_SPACING) {
+        doc.moveTo(0, y).lineTo(PAGE_W, y).stroke();
+      }
+      doc.restore();
+      break;
+    }
+    default:
+      break; // 'none' -- the white fill above is already enough
+  }
+}
+
 // Draws one page's full content (background, every slot, every floating
 // photo, and the page-number footer) onto `doc` at its current position in
 // the document -- shared by exportPdf (looping over every page) and
 // exportSinglePagePdf (just one), so the two can never drift apart in how
 // a page actually renders.
 async function drawPage(doc, photosById, page, pageIdx, { PAGE_W, PAGE_H, MARGIN, contentW, contentH, gap }) {
-  doc.rect(0, 0, PAGE_W, PAGE_H).fill('#ffffff');
+  drawBackground(doc, page, PAGE_W, PAGE_H);
 
   // A page with any slot resized via its free-form drag handle has
   // "graduated" out of the named-template grid -- every slot's own rect

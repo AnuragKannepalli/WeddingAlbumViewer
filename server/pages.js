@@ -121,7 +121,8 @@ function makeEmptySlots(layout) {
 function makePage(id, layout = 1) {
   return {
     id, layout, slots: makeEmptySlots(layout), splits: defaultSplitsForLayout(layout), floats: [],
-    isCover: false, coverTitle: '', coverSubtitle: '', coverDate: ''
+    isCover: false, coverTitle: '', coverSubtitle: '', coverDate: '',
+    background: { type: 'none', color: '#f3e9dc' }
   };
 }
 
